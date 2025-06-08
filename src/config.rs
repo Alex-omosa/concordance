@@ -2,8 +2,48 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::hash::Hash;
-
+use anyhow::{
+    Result,
+    Error
+};
 const DEFAULT_BATCH_MAX: usize = 200;
+
+
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BaseConfiguration {
+    /// Address of the NATS server
+    pub nats_url: String,
+    /// User JWT for connecting to the core NATS
+    pub user_jwt: Option<String>,
+    /// User seed for connecting to the core NATS
+    pub user_seed: Option<String>,
+    /// JetStream domain for the JS context used by this provider
+    pub js_domain: Option<String>,
+}
+
+impl Default for BaseConfiguration {
+    fn default() -> Self {
+        Self {
+            nats_url: "127.0.0.1:4222".to_string(),
+            user_jwt: None,
+            user_seed: None,
+            js_domain: None,
+        }
+    }
+}
+
+impl BaseConfiguration {
+    pub async fn get_nats_connection(&self) -> Result<async_nats::Client> {
+        let base_opts = async_nats::ConnectOptions::default();
+        Ok(base_opts
+            .name("Concordance Event Sourcing")
+            .connect(&self.nats_url)
+            .await
+            .map_err(|e| Error::msg(format!("failed to make NATS connection to {}: {}", self.nats_url, e)))?)
+    }
+}
+
 
 /// All entities participating in an event sourced system must declare their interest.
 /// Aggregates declare interest in the stream that corresponds to their name, notifiers and process managers declare interest

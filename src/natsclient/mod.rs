@@ -1,5 +1,6 @@
 mod natsconn;
 
+pub(crate) use natsconn::NatsClient;
 /// The default time given for an event/command to ack. Set to 3 to give a buffer
 /// for actors that have a default timeout of 2s
 pub(crate) const DEFAULT_ACK_TIME: std::time::Duration = std::time::Duration::from_secs(3);
@@ -14,8 +15,6 @@ use std::ops::DerefMut;
 use std::time::Duration;
 
 use tracing::{error, warn};
-
-pub(crate) use natsconn::NatsClient;
 
 
 const EVENT_STREAM_NAME: &str = "CC_EVENTS";

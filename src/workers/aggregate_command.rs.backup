@@ -1,0 +1,209 @@
+use async_nats::jetstream::Context;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use tracing::{debug, error, instrument, trace};
+
+use crate::{
+    events::publish_es_event,
+    config::InterestDeclaration,
+    consumers::{Worker, WorkResult, WorkError, RawCommand},
+    natsclient::AckableMessage,
+    state::EntityState,
+};
+
+// Add these structs
+#[derive(Debug, Clone)]
+pub struct StatefulCommand {
+    pub aggregate: String,
+    pub command_type: String,
+    pub key: String,
+    pub state: Option<Vec<u8>>,
+    pub payload: Vec<u8>,
+}
+
+
+
+// Your existing AggregateCommandWorker struct stays the same
+pub struct AggregateCommandWorker {
+    pub nc: async_nats::Client,
+    pub context: Context,
+    pub interest: InterestDeclaration,
+    pub state: EntityState,
+}
+
+// Define the aggregate behavior
+pub trait Aggregate: Sized {
+    /// Create aggregate from stored state (or new if None)
+    fn from_state(id: String, state: Option<Vec<u8>>) -> Result<Self, WorkError>;
+    
+    /// Serialize current state for storage
+    fn to_state(&self) -> Result<Vec<u8>, WorkError>;
+    
+    /// Handle a command and return resulting events
+    fn handle_command(&mut self, command: StatefulCommand) -> Result<Vec<ConcordanceEvent>, WorkError>;
+}
+
+
+// Order domain types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OrderStatus {
+    Created,
+    Paid,
+    Shipped,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderAggregate {
+    pub id: String,
+    pub status: OrderStatus,
+    pub customer_id: String,
+    pub total_amount: f64,
+    pub items: Vec<OrderItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderItem {
+    pub product_id: String,
+    pub quantity: u32,
+    pub price: f64,
+}
+
+// Command types (these come from the JSON payload)
+#[derive(Debug, Deserialize)]
+pub struct CreateOrderCommand {
+    pub customer_id: String,
+    pub items: Vec<OrderItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelOrderCommand {
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PayOrderCommand {
+    pub payment_method: String,
+    pub amount: f64,
+}
+
+impl Aggregate for OrderAggregate {
+    fn from_state(id: String, state: Option<Vec<u8>>) -> Result<Self, WorkError> {
+        match state {
+            Some(bytes) => {
+                // Deserialize existing state
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| WorkError::Other(format!("Failed to deserialize order state: {}", e)))
+            }
+            None => {
+                // Create new aggregate (empty state)
+                Ok(OrderAggregate {
+                    id,
+                    status: OrderStatus::Created,
+                    customer_id: String::new(),
+                    total_amount: 0.0,
+                    items: Vec::new(),
+                })
+            }
+        }
+    }
+    
+    fn to_state(&self) -> Result<Vec<u8>, WorkError> {
+        serde_json::to_vec(self)
+            .map_err(|e| WorkError::Other(format!("Failed to serialize order state: {}", e)))
+    }
+    
+    fn handle_command(&mut self, command: StatefulCommand) -> Result<Vec<ConcordanceEvent>, WorkError> {
+        match command.command_type.as_str() {
+            "create_order" => self.handle_create_order(command),
+            "cancel_order" => self.handle_cancel_order(command),
+            "pay_order" => self.handle_pay_order(command),
+            _ => Err(WorkError::Other(format!("Unknown command type: {}", command.command_type)))
+        }
+    }
+}
+
+impl OrderAggregate {
+    fn handle_create_order(&mut self, command: StatefulCommand) -> Result<Vec<ConcordanceEvent>, WorkError> {
+        // Parse command payload
+        let cmd: CreateOrderCommand = serde_json::from_slice(&command.payload)
+            .map_err(|e| WorkError::Other(format!("Failed to parse CreateOrder command: {}", e)))?;
+        
+        // Business rule: Can only create if not already created with items
+        if !self.items.is_empty() {
+            return Err(WorkError::Other("Order already exists".to_string()));
+        }
+        
+        // Calculate total
+        let total: f64 = cmd.items.iter().map(|item| item.price * item.quantity as f64).sum();
+        
+        // Create event
+        let event_payload = serde_json::json!({
+            "order_id": command.key,
+            "customer_id": cmd.customer_id,
+            "items": cmd.items,
+            "total_amount": total
+        });
+        
+        let event = ConcordanceEvent {
+            event_type: "OrderCreated".to_string(),
+            payload: serde_json::to_vec(&event_payload).unwrap(),
+            stream: command.aggregate.clone(),
+        };
+        
+        Ok(vec![event])
+    }
+    
+    fn handle_cancel_order(&mut self, command: StatefulCommand) -> Result<Vec<ConcordanceEvent>, WorkError> {
+        let cmd: CancelOrderCommand = serde_json::from_slice(&command.payload)
+            .map_err(|e| WorkError::Other(format!("Failed to parse CancelOrder command: {}", e)))?;
+        
+        // Business rule: Can't cancel if already shipped
+        if matches!(self.status, OrderStatus::Shipped) {
+            return Err(WorkError::Other("Cannot cancel shipped order".to_string()));
+        }
+        
+        let event_payload = serde_json::json!({
+            "order_id": command.key,
+            "reason": cmd.reason,
+            "cancelled_at": chrono::Utc::now().to_rfc3339()
+        });
+        
+        let event = ConcordanceEvent {
+            event_type: "OrderCancelled".to_string(),
+            payload: serde_json::to_vec(&event_payload).unwrap(),
+            stream: command.aggregate.clone(),
+        };
+        
+        Ok(vec![event])
+    }
+    
+    fn handle_pay_order(&mut self, command: StatefulCommand) -> Result<Vec<ConcordanceEvent>, WorkError> {
+        let cmd: PayOrderCommand = serde_json::from_slice(&command.payload)
+            .map_err(|e| WorkError::Other(format!("Failed to parse PayOrder command: {}", e)))?;
+        
+        // Business rule: Can only pay created orders
+        if !matches!(self.status, OrderStatus::Created) {
+            return Err(WorkError::Other("Order must be in Created status to pay".to_string()));
+        }
+        
+        // Business rule: Payment amount must match total
+        if (cmd.amount - self.total_amount).abs() > 0.01 {
+            return Err(WorkError::Other("Payment amount doesn't match order total".to_string()));
+        }
+        
+        let event_payload = serde_json::json!({
+            "order_id": command.key,
+            "amount": cmd.amount,
+            "payment_method": cmd.payment_method
+        });
+        
+        let event = ConcordanceEvent {
+            event_type: "OrderPaid".to_string(),
+            payload: serde_json::to_vec(&event_payload).unwrap(),
+            stream: command.aggregate.clone(),
+        };
+        
+        Ok(vec![event])
+    }
+}

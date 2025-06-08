@@ -1,1 +1,0 @@
-nats pub cc.commands.order "{\""command_type\"":\""CreateOrder\"",\""key\"":\""order-456\"",\""data\"":{\""customer_id\"":\""cust-789\"",\""total\"":150.99,\""items\"":[{\""name\"":\""Widget\"",\""qty\"":2,\""price\"":75.99}]}}"
