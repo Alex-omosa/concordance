@@ -15,6 +15,8 @@ pub trait AggregateService: Send + Sync {
     async fn handle_command(&self, ctx: &Context, cmd: &StatefulCommand) -> Result<EventList, String>;
     async fn apply_event(&self, ctx: &Context, event_with_state: &EventWithState) -> Result<StateAck, String>;
 }
+
+#[derive(Debug)]
 pub struct StatefulCommand {
     pub aggregate: String,
     pub command_type: String,

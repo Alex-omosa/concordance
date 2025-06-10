@@ -6,6 +6,7 @@ mod natsclient;
 mod provider;
 mod state;
 mod workers;
+mod aggregates;
 
 use crate::natsclient::NatsClient;
 use anyhow::Result;
@@ -57,7 +58,7 @@ impl ConcordanceProvider {
     /// bind to an existing NATS consumer
     pub async fn add_consumer(&self, decl: &InterestDeclaration) -> Result<bool> {
         
-        use InterestConstraint::*;
+        use InterestConstraint::Commands;
         Ok(match (&decl.interest_constraint, &decl.role) {
             (Commands, _) => self.add_aggregate_cmd_consumer(decl).await,
             // (Events, ProcessManager) => self.add_process_manager_consumer(decl).await,
