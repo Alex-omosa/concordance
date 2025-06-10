@@ -1,7 +1,5 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json;
-use std::sync::Arc;
 use tracing::{debug, error, instrument, trace};
 
 use crate::config::InterestDeclaration;
@@ -12,7 +10,7 @@ use crate::state::EntityState;
 use async_nats::jetstream::Context;
 
 // Generated types from your paste.txt
-use crate::eventsourcing::{AggregateService, Event, EventList, StatefulCommand};
+use crate::eventsourcing::{AggregateService, Event, StatefulCommand};
 
 pub trait Aggregate: Send + Sync {
     fn from_state(key: String, state: Option<Vec<u8>>) -> Result<Box<dyn Aggregate>, WorkError>
@@ -139,7 +137,7 @@ impl Worker for AggregateCommandWorker {
             .map_err(|e| WorkError::Other(format!("Failed to save state: {}", e)))?;
 
         // Step 7: ACK the command only after events are published and state is saved (UNCHANGED)
-        message.ack().await.map_err(|e| WorkError::NatsError(e))?;
+        message.ack().await.map_err(WorkError::NatsError)?;
 
         Ok(())
     }

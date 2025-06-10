@@ -36,11 +36,11 @@ impl Default for BaseConfiguration {
 impl BaseConfiguration {
     pub async fn get_nats_connection(&self) -> Result<async_nats::Client> {
         let base_opts = async_nats::ConnectOptions::default();
-        Ok(base_opts
+        base_opts
             .name("Concordance Event Sourcing")
             .connect(&self.nats_url)
             .await
-            .map_err(|e| Error::msg(format!("failed to make NATS connection to {}: {}", self.nats_url, e)))?)
+            .map_err(|e| Error::msg(format!("failed to make NATS connection to {}: {}", self.nats_url, e)))
     }
 }
 

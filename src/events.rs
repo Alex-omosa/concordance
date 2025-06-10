@@ -1,5 +1,5 @@
 use anyhow::{Result, Error};
-use crate::{consumers::RawCommand, eventsourcing::Event as ConcordanceEvent};
+use crate::eventsourcing::Event as ConcordanceEvent;
 use case::CaseExt;
 use chrono::Utc; // only using chrono because cloudevents SDK needs it
 use cloudevents::AttributesReader;

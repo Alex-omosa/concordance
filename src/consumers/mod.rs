@@ -3,7 +3,6 @@ pub(crate) mod events_consumer;
 mod manager;
 
 pub use commands_consumer::{CommandConsumer, RawCommand};
-pub use events_consumer::EventConsumer;
 pub use manager::ConsumerManager;
 
 use std::{collections::HashMap, fmt::Debug, sync::Arc};

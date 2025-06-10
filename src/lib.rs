@@ -9,11 +9,10 @@ mod workers;
 
 use crate::natsclient::NatsClient;
 use anyhow::Result;
-use async_trait::async_trait;
-use tracing::{error, instrument, warn};
+use tracing::{error, warn};
 
 use crate::{
-    consumers::{CommandConsumer, ConsumerManager, EventConsumer},
+    consumers::{CommandConsumer, ConsumerManager},
     state::EntityState,
     workers::AggregateCommandWorker,
 };
@@ -57,7 +56,7 @@ impl ConcordanceProvider {
     /// Adds a consumer and the appropriate worker to the provider's consumer manager, which will in turn create or
     /// bind to an existing NATS consumer
     pub async fn add_consumer(&self, decl: &InterestDeclaration) -> Result<bool> {
-        use ActorRole::*;
+        
         use InterestConstraint::*;
         Ok(match (&decl.interest_constraint, &decl.role) {
             (Commands, _) => self.add_aggregate_cmd_consumer(decl).await,
