@@ -1,34 +1,35 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json;
 use std::sync::Arc;
 use tracing::{debug, error, instrument, trace};
-use serde_json;
 
-use crate::natsclient::AckableMessage;
-use crate::consumers::{WorkResult,Worker, RawCommand, WorkError};
-use crate::state::EntityState;
 use crate::config::InterestDeclaration;
+use crate::consumers::{RawCommand, WorkError, WorkResult, Worker};
 use crate::events::publish_es_event;
+use crate::natsclient::AckableMessage;
+use crate::state::EntityState;
 use async_nats::jetstream::Context;
 
 // Generated types from your paste.txt
-use crate::eventsourcing::{AggregateService, EventList, Event,StatefulCommand };
-
+use crate::eventsourcing::{AggregateService, Event, EventList, StatefulCommand};
 
 pub trait Aggregate: Send + Sync {
-    fn from_state(key: String, state: Option<Vec<u8>>) -> Result<Box<dyn Aggregate>, WorkError> 
-    where Self: Sized;
-    
+    fn from_state(key: String, state: Option<Vec<u8>>) -> Result<Box<dyn Aggregate>, WorkError>
+    where
+        Self: Sized;
+
     fn handle_command(&mut self, command: StatefulCommand) -> Result<Vec<Event>, WorkError>;
-    
+
     fn to_state(&self) -> Result<Option<Vec<u8>>, WorkError>;
 }
 
 // Simple generic worker - no registry needed!
 pub struct AggregateCommandWorker {
     pub nc: async_nats::Client,
-    pub context: Context,           // ← You have this
+    pub context: Context, // ← You have this
     pub interest: InterestDeclaration,
-    pub state: EntityState,         // ← Concrete type, not trait
+    pub state: EntityState, // ← Concrete type, not trait
 }
 impl AggregateCommandWorker {
     pub fn new(
@@ -38,7 +39,10 @@ impl AggregateCommandWorker {
         state: EntityState,
     ) -> Self {
         Self {
-            nc,context, interest, state
+            nc,
+            context,
+            interest,
+            state,
         }
     }
 }
@@ -46,11 +50,10 @@ impl AggregateCommandWorker {
 #[async_trait]
 impl Worker for AggregateCommandWorker {
     type Message = RawCommand;
-    
+
     #[instrument(level = "debug", skip_all, fields(entity_name = self.interest.entity_name))]
     async fn do_work(&self, mut message: AckableMessage<Self::Message>) -> WorkResult<()> {
         debug!(command = ?message.as_ref(), "Handling received command");
-
         // Step 1: Load existing state from the state store (UNCHANGED)
         let state = self
             .state
@@ -65,7 +68,6 @@ impl Worker for AggregateCommandWorker {
         if let Some(ref vec) = state {
             trace!("Loaded pre-existing state - {} bytes", vec.len());
         }
-
         // Step 2: Create the aggregate from state - NOW GENERIC! 🎯
         let mut aggregate = match self.interest.entity_name.as_str() {
             "order" => OrderAggregate::from_state(message.key.clone(), state)?,
@@ -74,7 +76,7 @@ impl Worker for AggregateCommandWorker {
             // "inventory" => InventoryAggregate::from_state(message.key.clone(), state)?,
             _ => {
                 return Err(WorkError::Other(format!(
-                    "Unknown entity type: {}", 
+                    "Unknown entity type: {}",
                     self.interest.entity_name
                 )));
             }
@@ -88,7 +90,8 @@ impl Worker for AggregateCommandWorker {
             state: None, // We already loaded this above
             payload: serde_json::to_vec(&message.data).map_err(|e| {
                 WorkError::Other(format!(
-                    "Raw inbound command payload could not be converted to vec: {}", e
+                    "Raw inbound command payload could not be converted to vec: {}",
+                    e
                 ))
             })?,
         };
@@ -99,7 +102,7 @@ impl Worker for AggregateCommandWorker {
             stateful_command.command_type,
             self.interest.entity_name
         );
-        
+
         let outbound_events = aggregate.handle_command(stateful_command).map_err(|e| {
             error!("Aggregate failed to handle command: {:?}", e);
             e
@@ -142,25 +145,9 @@ impl Worker for AggregateCommandWorker {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // Example aggregate implementations that implement the common trait
+
+#[derive(Serialize, Deserialize)]
 pub struct OrderAggregate {
     key: String,
     // ... your order-specific fields
@@ -175,17 +162,29 @@ impl Aggregate for OrderAggregate {
         };
         Ok(Box::new(order))
     }
-    
+
     fn handle_command(&mut self, command: StatefulCommand) -> Result<Vec<Event>, WorkError> {
         // Your existing order command handling logic
         match command.command_type.as_str() {
-            "CreateOrder" => Ok(vec![]), // Return empty vec for now
-            "UpdateOrder" => Ok(vec![]), // Return empty vec for now
-            "CancelOrder" => Ok(vec![]), // Return empty vec for now
-            _ => Err(WorkError::Other(format!("Unknown order command: {}", command.command_type)))
+            "create_order" => {
+                trace!("Handling create_order command ...");
+                Ok(vec![])
+            } // Return empty vec for now
+            "update_order" => {
+                trace!("Handling update_order command ...");
+                Ok(vec![])
+            } // Return empty vec for now
+            "cancel_order" => {
+                trace!("Handling cancel_order command ...");
+                Ok(vec![])
+            } // Return empty vec for now
+            _ => Err(WorkError::Other(format!(
+                "Unknown order command: {}",
+                command.command_type
+            ))),
         }
     }
-    
+
     fn to_state(&self) -> Result<Option<Vec<u8>>, WorkError> {
         // Your existing logic to serialize OrderAggregate to bytes
         // serialize self into Vec<u8>
@@ -195,7 +194,7 @@ impl Aggregate for OrderAggregate {
 
 pub struct AccountAggregate {
     key: String,
-    // ... your account-specific fields  
+    // ... your account-specific fields
 }
 
 impl Aggregate for AccountAggregate {
@@ -206,25 +205,28 @@ impl Aggregate for AccountAggregate {
         };
         Ok(Box::new(account))
     }
-    
+
     fn handle_command(&mut self, command: StatefulCommand) -> Result<Vec<Event>, WorkError> {
         match command.command_type.as_str() {
             "CreateAccount" => {
                 println!("CreateAccount");
                 Ok(vec![])
-            },
+            }
             "DebitAccount" => {
                 println!("DebitAccount");
                 Ok(vec![])
-            },
+            }
             "CreditAccount" => {
                 println!("CreditAccount");
                 Ok(vec![])
-            },
-            _ => Err(WorkError::Other(format!("Unknown account command: {}", command.command_type)))
+            }
+            _ => Err(WorkError::Other(format!(
+                "Unknown account command: {}",
+                command.command_type
+            ))),
         }
     }
-    
+
     fn to_state(&self) -> Result<Option<Vec<u8>>, WorkError> {
         // serialize account state
         todo!("Serialize account state")
@@ -232,7 +234,7 @@ impl Aggregate for AccountAggregate {
 }
 
 // You can add more aggregates by just implementing the Aggregate trait
-pub struct UserAggregate { /* ... */ }
-pub struct InventoryAggregate { /* ... */ }
+pub struct UserAggregate {/* ... */}
+pub struct InventoryAggregate {/* ... */}
 // impl Aggregate for UserAggregate { /* ... */ }
 // impl Aggregate for InventoryAggregate { /* ... */ }

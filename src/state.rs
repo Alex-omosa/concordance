@@ -6,7 +6,7 @@ use crate::{config::ActorRole, Result};
 
 pub(crate) const STATE_BUCKET_NAME: &str = "CC_STATE";
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EntityState {
     bucket: Store,
 }

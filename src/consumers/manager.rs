@@ -1,19 +1,18 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use std::collections::HashMap;
-use futures::{Stream, StreamExt};
 use crate::{
     config::{InterestConstraint, InterestDeclaration},
     natsclient::AckableMessage,
 };
-use tracing::{error, trace, Instrument};
 use async_nats::jetstream::stream::Stream as NatsStream;
+use futures::{Stream, StreamExt};
+use std::collections::HashMap;
+use tracing::{error, trace, Instrument};
 
 use super::{CreateConsumer, WorkError, WorkHandles, WorkResult, Worker};
 
-
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ConsumerManager {
     handles: WorkHandles,
     evt_stream: NatsStream,
@@ -80,8 +79,6 @@ impl ConsumerManager {
             .unwrap_or(false)
     }
 }
-
-
 
 async fn work_fn<C, W>(mut consumer: C, worker: W, _interest: InterestDeclaration) -> WorkResult<()>
 where
