@@ -10,6 +10,7 @@ use async_nats::jetstream::{
     consumer::pull::{Config as PullConfig},
     Context, AckKind,
 };
+use anyhow::{Result, Error as AnyhowError};
 
 // ============ ENHANCED BUSINESS AGGREGATES ============
 
@@ -191,11 +192,11 @@ pub struct RawCommand {
 // ============ ENHANCED WORKER WITH STATE PERSISTENCE ============
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
-        .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
+        // .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
         .init();
 
     info!("Starting Enhanced Concordance Worker with State Persistence");
@@ -249,7 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn ensure_streams(js: &Context) -> Result<(), Box<dyn std::error::Error>> {
+async fn ensure_streams(js: &Context) -> Result<()> {
     use async_nats::jetstream::stream::{Config as StreamConfig, RetentionPolicy, StorageType};
 
     info!("Ensuring NATS streams exist...");
@@ -283,7 +284,7 @@ async fn run_enhanced_worker(
     js: Context,
     state: EntityState,
     aggregate_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     let consumer_name = format!("AGG_CMD_{}", aggregate_name);
     let filter_subject = format!("cc.commands.{}", aggregate_name);
 
@@ -339,7 +340,8 @@ async fn run_enhanced_worker(
                         }
                     }
                     Err(e) => {
-                        error!("Command processing failed: {:?}", e);
+                        let error_msg = format!("Command processing failed: {}", e);
+                        error!("{}", error_msg);
                         // Nack the command so it can be retried
                         if let Err(nack_err) = message.ack_with(AckKind::Nak(None)).await {
                             error!("Failed to nack command: {}", nack_err);
@@ -363,7 +365,7 @@ async fn process_command_with_state(
     nc: &async_nats::Client,
     aggregate_name: &str,
     raw_command: RawCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
     let key = &raw_command.key;
     
     // Step 1: Load current state from NATS KV
@@ -382,7 +384,8 @@ async fn process_command_with_state(
         command_type: raw_command.command_type,
         key: key.clone(),
         state: None, // Not used in enhanced flow
-        payload: serde_json::to_vec(&raw_command.data)?,
+        payload: serde_json::to_vec(&raw_command.data)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize command data: {}", e))?,
     };
 
     // Step 3: Use enhanced dispatch that handles command → events → state update
@@ -392,7 +395,7 @@ async fn process_command_with_state(
         key.clone(),
         current_state,
         stateful_command,
-    ).map_err(|e| format!("Enhanced dispatch failed: {}", e))?;
+    ).map_err(|e| anyhow::anyhow!("Enhanced dispatch failed: {}", e))?;
 
     info!("Enhanced dispatch produced {} events", events.len());
 
@@ -413,7 +416,7 @@ async fn process_command_with_state(
     Ok(())
 }
 
-async fn publish_event(nc: &async_nats::Client, event: Event) -> Result<(), Box<dyn std::error::Error>> {
+async fn publish_event(nc: &async_nats::Client, event: Event) -> Result<()> {
     let subject = format!("cc.events.{}", event.event_type);
     
     let cloud_event = serde_json::json!({
@@ -426,8 +429,11 @@ async fn publish_event(nc: &async_nats::Client, event: Event) -> Result<(), Box<
         "data": serde_json::from_slice::<serde_json::Value>(&event.payload).unwrap_or_default(),
     });
 
-    let payload = serde_json::to_vec(&cloud_event)?;
-    nc.publish(subject, payload.into()).await?;
+    let payload = serde_json::to_vec(&cloud_event)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize cloud event: {}", e))?;
+    
+    nc.publish(subject, payload.into()).await
+        .map_err(|e| anyhow::anyhow!("Failed to publish event: {}", e))?;
     
     info!("Published event: {}", event.event_type);
     Ok(())

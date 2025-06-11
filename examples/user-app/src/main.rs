@@ -189,8 +189,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 2: Direct Enhanced Dispatch (with state)
     test_enhanced_dispatch().await?;
 
-    // Test 3: Full Provider Integration
-    test_provider_integration().await?;
+    // Test 3: State Persistence Integration
+    test_state_persistence().await?;
 
     info!("");
     info!("ENHANCED CONCORDANCE COMPLETE!");
@@ -213,7 +213,8 @@ async fn test_enhanced_provider() -> Result<(), Box<dyn std::error::Error>> {
         Ok(provider) => {
             info!("   Enhanced provider initialized successfully!");
             info!("   Registered aggregates: {:?}", provider.registered_aggregates());
-            info!("   State persistence: NATS KV");
+            info!("   NATS connection: Active");
+            info!("   JetStream: Enabled");
             info!("   Health check: Passed");
         }
         Err(e) => {
@@ -272,61 +273,76 @@ async fn test_enhanced_dispatch() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn test_provider_integration() -> Result<(), Box<dyn std::error::Error>> {
-    info!("TEST 3: Full Provider Integration Test");
+async fn test_state_persistence() -> Result<(), Box<dyn std::error::Error>> {
+    info!("TEST 3: State Persistence Integration");
     
-    // This test requires NATS to be running
+    // This test demonstrates state persistence with NATS KV
     match ConcordanceProvider::new().await {
         Ok(provider) => {
-            info!("   Testing full command processing with persistence...");
+            info!("   Testing state persistence with NATS KV...");
             
+            // Get JetStream context for state operations
+            let js = provider.jetstream();
+            let state = EntityState::new_from_context(js).await?;
+            
+            // Test state persistence workflow
+            let test_key = "order-state-test-789";
+            let test_aggregate_name = "order";
+            
+            // Create and process a command
             let command = StatefulCommand {
-                aggregate: "order".to_string(),
+                aggregate: test_aggregate_name.to_string(),
                 command_type: "create_order".to_string(),
-                key: "order-provider-456".to_string(),
+                key: test_key.to_string(),
                 state: None,
                 payload: serde_json::to_vec(&CreateOrderPayload {
-                    customer_id: "provider-customer".to_string(),
+                    customer_id: "state-test-customer".to_string(),
                     total: 299.99,
                     items: vec![OrderItem {
-                        name: "Provider Test Item".to_string(),
-                        quantity: 2,
-                        price: 149.99,
+                        name: "State Test Item".to_string(),
+                        quantity: 1,
+                        price: 299.99,
                     }],
                 }).unwrap(),
             };
 
-            // Use the provider's process_command method (includes persistence)
-            match provider.process_command("order", "order-provider-456", command).await {
-                Ok(events) => {
-                    info!("   Provider command processing successful!");
+            // Use enhanced dispatch to process command
+            match dispatch_command(test_aggregate_name, test_key.to_string(), None, command) {
+                Ok((events, new_state)) => {
+                    info!("   Command processed successfully");
                     info!("   Events generated: {}", events.len());
-                    info!("   State automatically persisted to NATS KV");
                     
-                    // Verify state was persisted by loading it back
-                    match provider.state().fetch_state("order", "order-provider-456").await {
-                        Ok(Some(state_bytes)) => {
-                            let order: OrderAggregate = serde_json::from_slice(&state_bytes)?;
-                            info!("   Verified persisted state:");
-                            info!("     Status: {:?}", order.status);
-                            info!("     Total: ${:.2}", order.total);
-                            info!("     Version: {}", order.version);
-                        }
-                        Ok(None) => {
-                            info!("   No state found in persistence (unexpected)");
-                        }
-                        Err(e) => {
-                            info!("   State fetch error: {}", e);
+                    if let Some(state_bytes) = new_state {
+                        // Save state to NATS KV
+                        let revision = state.write_state(test_aggregate_name, test_key, state_bytes).await?;
+                        info!("   State saved to NATS KV with revision: {}", revision);
+                        
+                        // Retrieve state back from NATS KV
+                        match state.fetch_state(test_aggregate_name, test_key).await? {
+                            Some(retrieved_state_bytes) => {
+                                let retrieved_order: OrderAggregate = serde_json::from_slice(&retrieved_state_bytes)?;
+                                info!("   State retrieved from NATS KV successfully!");
+                                info!("     Retrieved order status: {:?}", retrieved_order.status);
+                                info!("     Retrieved order total: ${:.2}", retrieved_order.total);
+                                info!("     Retrieved order version: {}", retrieved_order.version);
+                                
+                                // Clean up test data
+                                state.remove_state(test_aggregate_name, test_key).await?;
+                                info!("   Test data cleaned up");
+                            }
+                            None => {
+                                info!("   No state found in NATS KV (unexpected)");
+                            }
                         }
                     }
                 }
                 Err(e) => {
-                    info!("   Provider command processing failed: {}", e);
+                    info!("   Command processing failed: {}", e);
                 }
             }
         }
         Err(e) => {
-            info!("   Provider integration test skipped (NATS not available): {}", e);
+            info!("   State persistence test skipped (NATS not available): {}", e);
             info!("   To run full test: docker run -p 4222:4222 nats:latest --jetstream");
         }
     }
