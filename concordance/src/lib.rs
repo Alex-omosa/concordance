@@ -1,7 +1,8 @@
-// concordance/src/lib.rs - Enhanced with Auto-Setup and Worker Management
+// concordance/src/lib.rs - Enhanced with Auto-Setup, Worker Management, and Observability
 
 // ============ MODULES ============
 pub mod persistence;
+pub mod observability;
 
 // ============ RE-EXPORTS FOR NEW AGGREGATE SYSTEM ============
 
@@ -25,6 +26,8 @@ pub use persistence::EntityState;
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
 use futures::StreamExt;
+use crate::observability::{CorrelationContext, SpanBuilder, OperationLogger, OperationMetrics};
+use tracing::Instrument;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct BaseConfiguration {
@@ -204,17 +207,44 @@ impl ConcordanceProvider {
         command_type: &str,
         data: serde_json::Value,
     ) -> Result<Vec<Event>> {
-        tracing::debug!("📨 Processing command {} for {}.{}", command_type, aggregate_name, key);
+        let correlation_ctx = CorrelationContext::new(
+            aggregate_name.to_string(),
+            key.to_string(),
+            command_type.to_string(),
+        );
+        
+        let root_span = tracing::info_span!(
+            "api.handle_command",
+            correlation_id = %correlation_ctx.correlation_id,
+            aggregate.type = %aggregate_name,
+            aggregate.key = %key,
+            command.type = %command_type,
+        );
+        
+        async move {
+            OperationLogger::operation_started(&correlation_ctx);
+            
+            let raw_command = RawCommand {
+                command_type: command_type.to_string(),
+                key: key.to_string(),
+                data,
+            };
 
-        // Create the command
-        let raw_command = RawCommand {
-            command_type: command_type.to_string(),
-            key: key.to_string(),
-            data,
-        };
-
-        // Process using the same logic as the worker
-        self.process_single_command(aggregate_name, raw_command).await
+            let result = self.process_single_command(aggregate_name, raw_command).await;
+            
+            match &result {
+                Ok(events) => {
+                    OperationLogger::operation_completed(&correlation_ctx, 0, events.len());
+                }
+                Err(e) => {
+                    OperationLogger::operation_failed(&correlation_ctx, &e.to_string(), 0);
+                }
+            }
+            
+            result
+        }
+        .instrument(root_span)
+        .await
     }
 
     /// Internal method to process a command (shared with workers)
@@ -398,9 +428,9 @@ impl ConcordanceProvider {
     }
 }
 
-// ============ SIMPLIFIED WORKER FUNCTION ============
+// ============ SIMPLIFIED WORKER FUNCTION WITH OBSERVABILITY ============
 
-/// Simplified worker function that can be called from the provider
+/// Enhanced worker function with comprehensive observability
 pub async fn run_aggregate_worker(
     nc: async_nats::Client,
     js: async_nats::jetstream::Context,
@@ -410,7 +440,12 @@ pub async fn run_aggregate_worker(
     let consumer_name = format!("AGG_CMD_{}", aggregate_name);
     let filter_subject = format!("cc.commands.{}", aggregate_name);
 
-    tracing::info!("Creating consumer '{}' for aggregate '{}'", consumer_name, aggregate_name);
+    tracing::info!(
+        worker.aggregate_name = %aggregate_name,
+        worker.consumer_name = %consumer_name,
+        worker.filter_subject = %filter_subject,
+        "Starting aggregate worker"
+    );
 
     let stream = js.get_stream("CC_COMMANDS").await?;
     
@@ -432,94 +467,256 @@ pub async fn run_aggregate_worker(
         .await?;
 
     let mut messages = consumer.messages().await?;
-    tracing::info!("Worker for '{}' ready - waiting for commands...", aggregate_name);
+    
+    tracing::info!(
+        worker.aggregate_name = %aggregate_name,
+        worker.status = "ready",
+        "Worker ready to process commands"
+    );
 
     while let Some(msg) = messages.next().await {
         match msg {
             Ok(message) => {
+                // Extract NATS metadata
+                let nats_message_id = match message.info() {
+                    Ok(info) => Some(format!("{}", info.stream_sequence)),
+                    Err(_) => None,
+                };
+                let nats_subject = message.subject.clone();
+                
+                // Parse command
                 let raw_command: RawCommand = match serde_json::from_slice(&message.payload) {
                     Ok(cmd) => cmd,
                     Err(e) => {
-                        tracing::error!("Failed to parse command: {}. Acking and skipping.", e);
+                        tracing::error!(
+                            error = %e,
+                            nats.subject = %message.subject,
+                            nats.payload = ?String::from_utf8_lossy(&message.payload),
+                            "Failed to parse command"
+                        );
                         let _ = message.ack().await;
                         continue;
                     }
                 };
 
-                tracing::info!("Processing command: {} for key: {}", raw_command.command_type, raw_command.key);
+                // Create correlation context
+                let correlation_ctx = CorrelationContext::new(
+                    aggregate_name.to_string(),
+                    raw_command.key.clone(),
+                    raw_command.command_type.clone(),
+                )
+                .with_nats_info(nats_message_id, Some(nats_subject.to_string()));
 
-                // Process the command using enhanced dispatch
-                match process_command_with_state(&state, &nc, aggregate_name, raw_command).await {
+                // Process command with full observability
+                let operation_start = std::time::Instant::now();
+                
+                match process_command_with_observability(
+                    &state,
+                    &nc,
+                    aggregate_name,
+                    raw_command,
+                    correlation_ctx.clone(),
+                )
+                .await {
                     Ok(_) => {
+                        let ack_span = SpanBuilder::message_ack(&correlation_ctx, true);
+                        let _guard = ack_span.enter();
+                        
                         if let Err(e) = message.ack().await {
-                            tracing::error!("Failed to ack command: {}", e);
+                            tracing::error!(
+                                correlation_id = %correlation_ctx.correlation_id,
+                                error = %e,
+                                "Failed to acknowledge message"
+                            );
                         } else {
-                            tracing::info!("Command processed successfully");
+                            let duration_ms = operation_start.elapsed().as_millis() as u64;
+                            OperationLogger::operation_completed(&correlation_ctx, duration_ms, 0);
                         }
                     }
                     Err(e) => {
-                        tracing::error!("Command processing failed: {}", e);
+                        let duration_ms = operation_start.elapsed().as_millis() as u64;
+                        OperationLogger::operation_failed(&correlation_ctx, &e.to_string(), duration_ms);
+                        
+                        let ack_span = SpanBuilder::message_ack(&correlation_ctx, false);
+                        let _guard = ack_span.enter();
+                        
                         if let Err(nack_err) = message.ack_with(async_nats::jetstream::AckKind::Nak(None)).await {
-                            tracing::error!("Failed to nack command: {}", nack_err);
+                            tracing::error!(
+                                correlation_id = %correlation_ctx.correlation_id,
+                                error = %nack_err,
+                                "Failed to nack message"
+                            );
                         }
                     }
                 }
             }
             Err(e) => {
-                tracing::error!("Error receiving message: {}. Will continue...", e);
+                tracing::error!(
+                    worker.aggregate_name = %aggregate_name,
+                    error = %e,
+                    "Error receiving message from NATS"
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
     }
 
+    tracing::warn!(
+        worker.aggregate_name = %aggregate_name,
+        "Worker message stream ended"
+    );
     Ok(())
 }
 
-/// Enhanced command processing with state persistence
-async fn process_command_with_state(
+/// Enhanced command processing with full observability
+async fn process_command_with_observability(
     state: &EntityState,
     nc: &async_nats::Client,
     aggregate_name: &str,
     raw_command: RawCommand,
+    correlation_ctx: CorrelationContext,
 ) -> Result<()> {
-    let key = &raw_command.key;
+    // Create root span for entire operation
+    let root_span = SpanBuilder::worker_processing(&correlation_ctx);
     
-    // Step 1: Load current state from NATS KV
-    tracing::debug!("Loading state for {}.{}", aggregate_name, key);
-    let current_state = state.fetch_state(aggregate_name, key).await?;
+    async move {
+        let mut metrics = OperationMetrics::new();
+        metrics.mark_command_received();
+        
+        OperationLogger::operation_started(&correlation_ctx);
+        
+        let key = &raw_command.key;
+        
+        // Step 1: Load state with observability
+        let state_span = SpanBuilder::state_load(&correlation_ctx);
+        let current_state = {
+            let _guard = state_span.enter();
+            
+            tracing::debug!(
+                correlation_id = %correlation_ctx.correlation_id,
+                state.key = %key,
+                "Loading aggregate state"
+            );
+            
+            let state_result = state.fetch_state(aggregate_name, key).await?;
+            let state_size = state_result.as_ref().map(|s| s.len());
+            
+            metrics.mark_state_loaded(state_size);
+            
+            tracing::debug!(
+                correlation_id = %correlation_ctx.correlation_id,
+                state.exists = %state_result.is_some(),
+                state.size_bytes = ?state_size,
+                "State loaded"
+            );
+            
+            state_result
+        };
 
-    // Step 2: Create StatefulCommand
-    let stateful_command = StatefulCommand {
-        aggregate: aggregate_name.to_string(),
-        command_type: raw_command.command_type,
-        key: key.clone(),
-        state: None, // Not used in enhanced flow
-        payload: serde_json::to_vec(&raw_command.data)?,
-    };
+        // Step 2: Create StatefulCommand
+        let stateful_command = StatefulCommand {
+            aggregate: aggregate_name.to_string(),
+            command_type: raw_command.command_type,
+            key: key.clone(),
+            state: None,
+            payload: serde_json::to_vec(&raw_command.data)?,
+        };
 
-    // Step 3: Use enhanced dispatch that handles command → events → state update
-    tracing::debug!("Dispatching command using enhanced flow");
-    let (events, new_state) = dispatch_command(
-        aggregate_name,
-        key.clone(),
-        current_state,
-        stateful_command,
-    )?;
+        // Step 3: Dispatch command with domain layer observability
+        let dispatch_span = SpanBuilder::domain_command_handling(&correlation_ctx);
+        let (events, new_state) = {
+            let _guard = dispatch_span.enter();
+            
+            tracing::debug!(
+                correlation_id = %correlation_ctx.correlation_id,
+                command.type = %stateful_command.command_type,
+                "Dispatching command to aggregate"
+            );
+            
+            let dispatch_result = dispatch_command(
+                aggregate_name,
+                key.clone(),
+                current_state,
+                stateful_command,
+            )?;
+            
+            metrics.mark_command_handled(dispatch_result.0.len());
+            
+            tracing::debug!(
+                correlation_id = %correlation_ctx.correlation_id,
+                events.count = %dispatch_result.0.len(),
+                state.updated = %dispatch_result.1.is_some(),
+                "Command handled by aggregate"
+            );
+            
+            dispatch_result
+        };
 
-    tracing::debug!("Enhanced dispatch produced {} events", events.len());
+        // Log each generated event
+        for event in &events {
+            let event_size = event.payload.len();
+            metrics.add_event_size(event_size);
+            OperationLogger::event_generated(&correlation_ctx, &event.event_type, event_size);
+        }
 
-    // Step 4: Persist the new state to NATS KV
-    if let Some(state_bytes) = new_state {
-        tracing::debug!("Saving updated state ({} bytes)", state_bytes.len());
-        let _revision = state.write_state(aggregate_name, key, state_bytes).await?;
+        metrics.mark_events_applied();
+
+        // Step 4: Persist state with observability
+        if let Some(state_bytes) = new_state {
+            let persist_span = SpanBuilder::state_persist(&correlation_ctx);
+            let _guard = persist_span.enter();
+            
+            let state_size = state_bytes.len();
+            
+            tracing::debug!(
+                correlation_id = %correlation_ctx.correlation_id,
+                state.size_bytes = %state_size,
+                "Persisting aggregate state"
+            );
+            
+            let revision = state.write_state(aggregate_name, key, state_bytes).await?;
+            
+            metrics.mark_state_persisted();
+            
+            tracing::debug!(
+                correlation_id = %correlation_ctx.correlation_id,
+                state.revision = %revision,
+                "State persisted"
+            );
+        }
+
+        // Step 5: Publish events with observability
+        for event in events {
+            let event_type = event.event_type.clone();
+            let publish_span = SpanBuilder::event_publish(&correlation_ctx, &event_type);
+            
+            let _guard = publish_span.enter();
+            
+            tracing::debug!(
+                correlation_id = %correlation_ctx.correlation_id,
+                event.type = %event_type,
+                "Publishing event"
+            );
+            
+            publish_event_to_nats(nc, event).await?;
+            
+            OperationLogger::nats_interaction(
+                &correlation_ctx,
+                "publish",
+                &format!("cc.events.{}", &event_type)
+            );
+        }
+
+        metrics.mark_events_published();
+        metrics.mark_acknowledged();
+        
+        // Log final metrics
+        metrics.log_timings(&correlation_ctx);
+        
+        Ok(())
     }
-
-    // Step 5: Publish all events to NATS
-    for event in events {
-        publish_event_to_nats(nc, event).await?;
-    }
-
-    Ok(())
+    .instrument(root_span)
+    .await
 }
 
 /// Publish an event to NATS events stream

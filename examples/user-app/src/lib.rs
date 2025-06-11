@@ -1,4 +1,4 @@
-// examples/user-app/src/lib.rs - Clean Aggregate with Separate Command/Event Modules
+// examples/user-app/src/lib.rs - Clean Aggregate with Separate Command/Event Modules and Observability
 
 pub use concordance::*;
 
@@ -42,20 +42,36 @@ pub struct OrderItem {
     pub price: f64,
 }
 
-// ============ CLEAN AGGREGATE IMPLEMENTATION ============
+// ============ CLEAN AGGREGATE IMPLEMENTATION WITH OBSERVABILITY ============
 
 impl AggregateImpl for OrderAggregate {
     const NAME: &'static str = "order";
 
     fn from_state_direct(key: String, state: Option<Vec<u8>>) -> Result<Self, WorkError> {
+        let span = tracing::debug_span!(
+            "aggregate.from_state",
+            aggregate.type = "order",
+            aggregate.key = %key,
+            state.exists = state.is_some(),
+            state.size_bytes = state.as_ref().map(|s| s.len())
+        );
+        
+        let _guard = span.enter();
+        
         match state {
             Some(bytes) => {
-                tracing::debug!("Restoring OrderAggregate from {} bytes", bytes.len());
+                tracing::debug!("Deserializing order aggregate from state");
                 serde_json::from_slice(&bytes)
-                    .map_err(|e| WorkError::Other(format!("Deserialize failed: {}", e)))
+                    .map_err(|e| {
+                        tracing::error!(
+                            error = %e,
+                            "Failed to deserialize order state"
+                        );
+                        WorkError::Other(format!("Deserialize failed: {}", e))
+                    })
             }
             None => {
-                tracing::debug!("Creating new OrderAggregate: {}", key);
+                tracing::debug!("Creating new order aggregate");
                 Ok(OrderAggregate {
                     key,
                     customer_id: None,
@@ -70,55 +86,143 @@ impl AggregateImpl for OrderAggregate {
 
     /// 🎉 COMMAND HANDLING - Routes commands with match in lib.rs
     fn handle_command(&self, command: StatefulCommand) -> Result<Vec<Event>, WorkError> {
+        let span = tracing::info_span!(
+            "aggregate.handle_command",
+            aggregate.type = "order",
+            aggregate.key = %self.key,
+            aggregate.version = %self.version,
+            command.type = %command.command_type,
+        );
+        
+        let _guard = span.enter();
+        
         tracing::debug!(
-            "OrderAggregate[{}] v{} handling command: {}",
-            self.key,
-            self.version,
-            command.command_type
+            aggregate.status = ?self.status,
+            "Processing command"
         );
 
         // Route commands to specific handlers
-        match command.command_type.as_str() {
+        let result = match command.command_type.as_str() {
             "create_order" => commands::handle_create_order(self, &command),
             "confirm_order" => commands::handle_confirm_order(self, &command),
             "ship_order" => commands::handle_ship_order(self, &command),
             "cancel_order" => commands::handle_cancel_order(self, &command),
-            _ => Err(WorkError::Other(format!(
-                "Unknown order command: {}",
-                command.command_type
-            ))),
+            _ => {
+                tracing::warn!(
+                    command.type = %command.command_type,
+                    "Unknown command type"
+                );
+                Err(WorkError::Other(format!(
+                    "Unknown order command: {}",
+                    command.command_type
+                )))
+            }
+        };
+        
+        match &result {
+            Ok(events) => {
+                tracing::debug!(
+                    events.count = events.len(),
+                    events.types = ?events.iter().map(|e| &e.event_type).collect::<Vec<_>>(),
+                    "Command handled successfully"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Command handling failed"
+                );
+            }
         }
+        
+        result
     }
 
     /// 🎉 EVENT APPLICATION - Routes events with match in lib.rs
     fn apply_event(&mut self, event: &Event) -> Result<(), WorkError> {
+        let span = tracing::info_span!(
+            "aggregate.apply_event",
+            aggregate.type = "order",
+            aggregate.key = %self.key,
+            aggregate.version = %self.version,
+            event.type = %event.event_type,
+        );
+        
+        let _guard = span.enter();
+        
+        let previous_status = self.status.clone();
+        let previous_version = self.version;
+        
         tracing::debug!(
-            "OrderAggregate[{}] applying event: {}",
-            self.key,
-            event.event_type
+            aggregate.status = ?self.status,
+            "Applying event to aggregate"
         );
 
         // Route events to specific handlers
-        match event.event_type.as_str() {
+        let result = match event.event_type.as_str() {
             "order_created" => events::apply_order_created(self, event),
             "order_confirmed" => events::apply_order_confirmed(self, event),
             "order_shipped" => events::apply_order_shipped(self, event),
             "order_delivered" => events::apply_order_delivered(self, event),
             "order_cancelled" => events::apply_order_cancelled(self, event),
             _ => {
-                tracing::warn!("Unknown event type: {}", event.event_type);
+                tracing::warn!(
+                    event.type = %event.event_type,
+                    "Unknown event type"
+                );
                 Err(WorkError::Other(format!(
                     "Unknown order event: {}",
                     event.event_type
                 )))
             }
+        };
+        
+        match &result {
+            Ok(_) => {
+                tracing::debug!(
+                    state.transition.from_status = ?previous_status,
+                    state.transition.to_status = ?self.status,
+                    state.transition.from_version = %previous_version,
+                    state.transition.to_version = %self.version,
+                    "Event applied successfully"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Event application failed"
+                );
+            }
         }
+        
+        result
     }
 
     fn to_state(&self) -> Result<Option<Vec<u8>>, WorkError> {
+        let span = tracing::debug_span!(
+            "aggregate.to_state",
+            aggregate.type = "order",
+            aggregate.key = %self.key,
+            aggregate.version = %self.version,
+        );
+        
+        let _guard = span.enter();
+        
         serde_json::to_vec(self)
-            .map(Some)
-            .map_err(|e| WorkError::Other(format!("Failed to serialize state: {}", e)))
+            .map(|bytes| {
+                tracing::debug!(
+                    state.size_bytes = bytes.len(),
+                    "Serialized aggregate state"
+                );
+                Some(bytes)
+            })
+            .map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    "Failed to serialize aggregate state"
+                );
+                WorkError::Other(format!("Failed to serialize state: {}", e))
+            })
     }
 }
 

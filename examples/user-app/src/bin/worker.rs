@@ -1,50 +1,82 @@
-// examples/user-app/src/bin/worker.rs - Clean Worker Using Shared Code
+// examples/user-app/src/bin/worker.rs - Updated with observability
 
-use user_app::*; // Import everything from lib.rs
-use tracing::{info, Level};
+use user_app::*;
 use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        // .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
-        .init();
+    // Initialize structured logging with JSON output
+    concordance::observability::init_tracing();
 
-    info!("🚀 Starting Concordance Production Worker");
-    info!("Registered aggregates: {:?}", get_registered_aggregates());
+    tracing::info!(
+        service.name = "concordance-worker",
+        service.version = env!("CARGO_PKG_VERSION"),
+        "Starting Concordance Production Worker"
+    );
 
-    // 🎉 ALL SETUP IS HIDDEN IN THE FRAMEWORK!
-    let app = ConcordanceProvider::new().await?;
+    tracing::info!(
+        aggregates.registered = ?get_registered_aggregates(),
+        aggregates.count = get_registered_aggregates().len(),
+        "Registered aggregates discovered"
+    );
 
-    // Health check
-    match app.health_check().await {
-        Ok(health) => {
-            info!("✅ Health check passed!");
-            info!("   NATS: {:?}", health.nats);
-            info!("   JetStream: {:?}", health.jetstream);
-            info!("   State Store: {:?}", health.state_store);
+    // Create provider
+    let app = match ConcordanceProvider::new().await {
+        Ok(provider) => {
+            tracing::info!("Concordance provider initialized successfully");
+            provider
         }
         Err(e) => {
-            info!("⚠️  Health check issues: {}", e);
-            info!("   Will continue anyway...");
+            tracing::error!(
+                error = %e,
+                "Failed to initialize Concordance provider"
+            );
+            return Err(e);
+        }
+    };
+
+    // Health check with structured logging
+    match app.health_check().await {
+        Ok(health) => {
+            tracing::info!(
+                health.nats = ?health.nats,
+                health.jetstream = ?health.jetstream,
+                health.state_store = ?health.state_store,
+                health.aggregates = ?health.registered_aggregates,
+                "System health check completed"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Health check encountered issues"
+            );
         }
     }
 
-    // 🎉 WORKER MANAGEMENT IS AUTOMATED!
+    // Start workers
     let worker_handles = app.start_workers().await?;
+    
+    tracing::info!(
+        workers.count = worker_handles.len(),
+        nats.subjects.commands = "cc.commands.*",
+        nats.subjects.events = "cc.events.*",
+        nats.kv.bucket = "CC_STATE",
+        "All workers started successfully"
+    );
 
-    info!("✅ All workers started! Ready to process commands.");
-    info!("   📥 Listening: cc.commands.*");
-    info!("   📤 Publishing: cc.events.*");
-    info!("   💾 State: NATS KV (CC_STATE)");
-    info!("");
-    info!("Press Ctrl+C to stop.");
+    // Create a shutdown handler
+    let shutdown = tokio::signal::ctrl_c();
+    
+    tokio::select! {
+        _ = futures::future::try_join_all(worker_handles) => {
+            tracing::warn!("All workers have stopped");
+        }
+        _ = shutdown => {
+            tracing::info!("Received shutdown signal");
+        }
+    }
 
-    // Wait for all workers
-    futures::future::try_join_all(worker_handles).await?;
-
-    info!("👋 Shutting down gracefully");
+    tracing::info!("Worker shutting down gracefully");
     Ok(())
 }

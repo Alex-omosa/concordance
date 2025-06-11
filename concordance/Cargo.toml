@@ -26,8 +26,20 @@ cloudevents-sdk = "0.8.0"
 case = "1.0.0"
 anyhow = "1.0.98"
 chrono = "0.4.41"
-uuid = "1.17.0"
+uuid = { version = "1.17.0", features = ["v4", "serde"] }
 serde_bytes = "0.11.17"
+
+# Observability dependencies
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Optional: OpenTelemetry support
+opentelemetry = { version = "0.21", optional = true }
+opentelemetry-otlp = { version = "0.14", optional = true }
+tracing-opentelemetry = { version = "0.22", optional = true }
+
+[features]
+default = []
+opentelemetry = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 
 [dev-dependencies]
 tokio-test = "0.4"
