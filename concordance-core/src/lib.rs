@@ -2,8 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-use tracing::{error, trace};
-use std::collections::HashMap;
+use tracing::trace;
 
 // Re-export inventory for use in derive macros
 pub use inventory;

@@ -153,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
-        .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
+        // .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
         .init();
 
     info!("🚀 Starting Concordance Command Worker");
