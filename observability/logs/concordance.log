@@ -1,0 +1,41 @@
+warning: unused variable: `aggregate_name`
+  --> concordance-derive/src/lib.rs:39:9
+   |
+39 |     let aggregate_name = extract_aggregate_name(&input.attrs)?;
+   |         ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_aggregate_name`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: `concordance-derive` (lib) generated 1 warning
+warning: unused import: `warn`
+ --> concordance/src/persistence.rs:4:48
+  |
+4 | use tracing::{debug, error, instrument, trace, warn};
+  |                                                ^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: `concordance` (lib) generated 1 warning (run `cargo fix --lib -p concordance` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running `/home/alex-omosa/learn/concordance/target/debug/worker`
+{"timestamp":"2025-06-11T08:09:05.163691Z","level":"INFO","fields":{"message":"🚀 Initializing Concordance Event Sourcing Framework"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.163787Z","level":"INFO","fields":{"message":"📡 NATS Configuration:"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.163802Z","level":"INFO","fields":{"message":"   URL: nats://127.0.0.1:4222"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.163814Z","level":"INFO","fields":{"message":"   JWT: not set"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.163830Z","level":"INFO","fields":{"message":"   Seed: not set"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.163855Z","level":"INFO","fields":{"message":"   JS Domain: default"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.163885Z","level":"INFO","fields":{"message":"🎯 Concordance initializing with 1 registered aggregates: [order]"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.163923Z","level":"INFO","fields":{"message":"🔌 Connecting to NATS at: nats://127.0.0.1:4222"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.166570Z","level":"INFO","fields":{"message":"✅ Successfully connected to NATS!"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.166632Z","level":"INFO","fields":{"message":"🔧 Ensuring required NATS streams exist..."},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.171478Z","level":"INFO","fields":{"message":"✅ All required streams are ready!"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.171549Z","level":"INFO","fields":{"message":"✅ Concordance provider initialized successfully!"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.172539Z","level":"DEBUG","fields":{"message":"Initializing NATS KV bucket: CC_STATE"},"target":"concordance::persistence","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.173781Z","level":"DEBUG","fields":{"message":"Creating new KV bucket: CC_STATE"},"target":"concordance::persistence","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.175589Z","level":"INFO","fields":{"message":"🎯 Starting workers for 1 registered aggregates: [order]"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.175693Z","level":"INFO","fields":{"message":"✅ Worker started for aggregate: order"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.175734Z","level":"INFO","fields":{"message":"✅ All workers started successfully!"},"target":"concordance","threadName":"main","threadId":"ThreadId(1)"}
+{"timestamp":"2025-06-11T08:09:05.175841Z","level":"INFO","fields":{"message":"🔧 Starting worker for aggregate: order"},"target":"concordance","threadName":"tokio-runtime-worker","threadId":"ThreadId(6)"}
+{"timestamp":"2025-06-11T08:09:05.175935Z","level":"DEBUG","fields":{"message":"Initializing NATS KV bucket: CC_STATE"},"target":"concordance::persistence","threadName":"tokio-runtime-worker","threadId":"ThreadId(6)"}
+{"timestamp":"2025-06-11T08:09:05.176962Z","level":"DEBUG","fields":{"message":"Creating new KV bucket: CC_STATE"},"target":"concordance::persistence","threadName":"tokio-runtime-worker","threadId":"ThreadId(3)"}
+{"timestamp":"2025-06-11T08:09:05.178115Z","level":"ERROR","fields":{"message":"❌ Worker for order failed: Failed to create KV bucket: Error { kind: JetStream, source: Some(Error { kind: Other, source: Some(Error { kind: Other, source: Some(Error(\"data did not match any variant of untagged enum Response\", line: 0, column: 0)) }) }) }"},"target":"concordance","threadName":"tokio-runtime-worker","threadId":"ThreadId(3)"}

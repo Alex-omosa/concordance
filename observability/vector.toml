@@ -1,0 +1,75 @@
+# Vector configuration for Concordance logs
+
+# Input: Read Concordance JSON logs from file
+[sources.concordance_logs]
+type = "file"
+include = ["/logs/concordance*.log"]
+read_from = "beginning"
+file_key = "file"
+max_read_bytes = 10240
+
+# Transform: Parse JSON logs
+[transforms.parse_concordance]
+type = "remap"
+inputs = ["concordance_logs"]
+source = '''
+parsed = parse_json!(.message)
+. = parsed
+
+# Add timestamp if not present
+if !exists(.timestamp) {
+  .timestamp = now()
+}
+
+# Ensure required fields exist with defaults
+.level = string(.level) ?? "INFO"
+.target = string(.target) ?? "unknown"
+.layer = string(.layer) ?? "unknown"
+
+# Extract aggregate info safely
+if exists(."aggregate.type") {
+  .aggregate_type = string(."aggregate.type") ?? "unknown"
+} else {
+  .aggregate_type = "unknown"
+}
+
+if exists(."aggregate.key") {
+  .aggregate_key = string(."aggregate.key") ?? ""
+}
+
+if exists(.correlation_id) {
+  .correlation_id = string(.correlation_id) ?? ""
+}
+
+# Extract metrics
+if exists(.duration_ms) {
+  .duration_ms = to_float(.duration_ms) ?? 0.0
+}
+
+if exists(."events.generated") {
+  .events_generated = to_int(."events.generated") ?? 0
+}
+'''
+
+# Output: Send to Loki
+[sinks.loki]
+type = "loki"
+inputs = ["parse_concordance"]
+endpoint = "http://loki:3100"
+encoding.codec = "json"
+healthcheck.enabled = true
+
+# Labels for Loki
+[sinks.loki.labels]
+job = "concordance"
+level = "{{ level }}"
+target = "{{ target }}"
+layer = "{{ layer }}"
+aggregate_type = "{{ aggregate_type }}"
+
+# Optional: Console output for debugging
+[sinks.console]
+type = "console"
+inputs = ["parse_concordance"]
+encoding.codec = "json"
+target = "stdout"

@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  # NATS with JetStream
+  nats:
+    image: nats:2.10-alpine
+    container_name: concordance-nats
+    ports:
+      - "4222:4222"  # Client connections
+      - "8222:8222"  # HTTP monitoring
+    command: ["--jetstream", "--store_dir", "/data"]
+    volumes:
+      - nats-data:/data
+    networks:
+      - concordance-net
+
+  # Loki for log aggregation
+  loki:
+    image: grafana/loki:2.9.0
+    container_name: concordance-loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    networks:
+      - concordance-net
+
+  # Tempo for distributed tracing
+  tempo:
+    image: grafana/tempo:2.3.0
+    container_name: concordance-tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo-config.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/tmp/tempo
+    ports:
+      - "3200:3200"   # Tempo query frontend
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+    networks:
+      - concordance-net
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: concordance-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=concordance
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - loki
+      - tempo
+    networks:
+      - concordance-net
+
+  # Vector for log collection and shipping
+  vector:
+    image: timberio/vector:0.34.0-alpine
+    container_name: concordance-vector
+    volumes:
+      - ./vector.toml:/etc/vector/vector.toml:ro
+      - ./logs:/logs:ro  # Mount directory where Concordance writes logs
+    command: ["--config", "/etc/vector/vector.toml"]
+    depends_on:
+      - loki
+    networks:
+      - concordance-net
+
+networks:
+  concordance-net:
+    driver: bridge
+
+volumes:
+  nats-data:
+  loki-data:
+  tempo-data:
+  grafana-data:
