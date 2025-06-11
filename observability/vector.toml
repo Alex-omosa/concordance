@@ -4,9 +4,11 @@
 [sources.concordance_logs]
 type = "file"
 include = ["/logs/concordance*.log"]
-read_from = "beginning"
+read_from = "beginning" 
 file_key = "file"
 max_read_bytes = 10240
+ignore_older_secs = 86400  # 🔧 Process files up to 24 hours old
+multiline.start_pattern = "^{\"timestamp\""  # 🔧 JSON log line detection
 
 # Transform: Parse JSON logs
 [transforms.parse_concordance]
