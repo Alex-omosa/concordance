@@ -1,23 +1,37 @@
-// concordance-core/src/lib.rs - Enhanced with dynamic dispatch
+// concordance-core/src/lib.rs - Enhanced with apply_event support
 
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-use tracing::trace;
+use tracing::{error, trace};
 
 // Re-export inventory for use in derive macros
 pub use inventory;
 
-// ============ CORE TRAITS (unchanged) ============
+// ============ ENHANCED CORE TRAITS ============
 
+/// Core trait that all aggregates must implement
 pub trait AggregateImpl: Sized + Debug + Send + Sync {
+    /// The aggregate's name (used for routing and registration)
     const NAME: &'static str;
+
+    /// Create an aggregate instance from serialized state
     fn from_state_direct(key: String, state: Option<Vec<u8>>) -> Result<Self, WorkError>;
-    fn handle_command(&mut self, command: StatefulCommand) -> Result<Vec<Event>, WorkError>;
+    
+    /// Handle a command and return resulting events (READ-ONLY operation)
+    /// This should NOT modify the aggregate state
+    fn handle_command(&self, command: StatefulCommand) -> Result<Vec<Event>, WorkError>;
+    
+    /// Apply an event to update aggregate state (WRITE operation)
+    /// This modifies the aggregate state based on the event
+    fn apply_event(&mut self, event: &Event) -> Result<(), WorkError>;
+    
+    /// Serialize the aggregate's current state
     fn to_state(&self) -> Result<Option<Vec<u8>>, WorkError>;
 }
 
-// ============ CORE DATA TYPES (unchanged) ============
+// ============ CORE DATA TYPES ============
 
+/// Represents a command to be processed by an aggregate
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatefulCommand {
     pub aggregate: String,
@@ -27,6 +41,7 @@ pub struct StatefulCommand {
     pub payload: Vec<u8>,
 }
 
+/// Represents an event that occurred in the system
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub event_type: String,
@@ -34,6 +49,7 @@ pub struct Event {
     pub stream: String,
 }
 
+/// Error types for aggregate operations
 #[derive(Debug, Clone)]
 pub enum WorkError {
     Other(String),
@@ -49,10 +65,10 @@ impl std::fmt::Display for WorkError {
 
 impl std::error::Error for WorkError {}
 
-// ============ NEW: DYNAMIC DISPATCH SYSTEM ============
+// ============ ENHANCED DISPATCH SYSTEM ============
 
-/// Type-erased aggregate handler - this is the magic! ✨
-pub type AggregateHandler = fn(String, Option<Vec<u8>>, StatefulCommand) -> Result<Vec<Event>, WorkError>;
+/// Type-erased aggregate handler for the new command+event flow
+pub type AggregateHandler = fn(String, Option<Vec<u8>>, StatefulCommand) -> Result<(Vec<Event>, Option<Vec<u8>>), WorkError>;
 
 /// Enhanced registry that stores both names AND handlers
 pub struct AggregateDescriptor {
@@ -71,15 +87,15 @@ impl Debug for AggregateDescriptor {
 // Set up inventory collection for enhanced descriptors
 inventory::collect!(AggregateDescriptor);
 
-// ============ PHASE 2: REAL DISPATCH IMPLEMENTATION ============
+// ============ ENHANCED DISPATCH IMPLEMENTATION ============
 
-/// The actual dispatch implementation that calls real aggregates! 🎉
+/// Enhanced dispatch that handles command → events → state persistence
 pub fn dispatch_command(
     entity_name: &str,
     key: String,
     state: Option<Vec<u8>>,
     command: StatefulCommand,
-) -> Result<Vec<Event>, WorkError> {
+) -> Result<(Vec<Event>, Option<Vec<u8>>), WorkError> {
     trace!("Dispatching command {} to aggregate {}", command.command_type, entity_name);
     
     // Find the handler in our registry
@@ -94,28 +110,32 @@ pub fn dispatch_command(
             ))
         })?;
     
-    // 🎉 PHASE 2: Call the actual aggregate handler!
+    // Call the enhanced handler that returns both events and new state
     handler(key, state, command)
 }
 
-/// Create a handler function for a specific aggregate type
-/// This is called by the derive macro
+/// Create an enhanced handler function for a specific aggregate type
+/// This implements the full command → events → state update flow
 pub const fn create_aggregate_handler<T>() -> AggregateHandler 
 where
     T: AggregateImpl
 {
-    |key: String, state: Option<Vec<u8>>, command: StatefulCommand| -> Result<Vec<Event>, WorkError> {
-        // Create/restore the aggregate from state
+    |key: String, state: Option<Vec<u8>>, command: StatefulCommand| -> Result<(Vec<Event>, Option<Vec<u8>>), WorkError> {
+        // Step 1: Create/restore the aggregate from state
         let mut aggregate = T::from_state_direct(key, state)?;
         
-        // Let the aggregate handle the command
+        // Step 2: Handle the command (read-only) to generate events
         let events = aggregate.handle_command(command)?;
         
-        // TODO: Save the new state back (Phase 2.1)
-        // let new_state = aggregate.to_state()?;
-        // save_state_somewhere(new_state);
+        // Step 3: Apply each event to update the aggregate state
+        for event in &events {
+            aggregate.apply_event(event)?;
+        }
         
-        Ok(events)
+        // Step 4: Serialize the updated state
+        let new_state = aggregate.to_state()?;
+        
+        Ok((events, new_state))
     }
 }
 
@@ -130,7 +150,7 @@ where
     }
 }
 
-// ============ UTILITY FUNCTIONS (unchanged) ============
+// ============ UTILITY FUNCTIONS ============
 
 pub fn get_registered_aggregates() -> Vec<&'static str> {
     inventory::iter::<AggregateDescriptor>()
@@ -155,7 +175,7 @@ macro_rules! register_aggregate {
     };
 }
 
-// ============ PHASE 2 TESTING ============
+// ============ TESTING ============
 
 #[cfg(test)]
 mod tests {
@@ -165,25 +185,52 @@ mod tests {
     struct TestOrder {
         key: String,
         status: String,
+        version: u32,
     }
 
     impl AggregateImpl for TestOrder {
         const NAME: &'static str = "test_order";
 
-        fn from_state_direct(key: String, _state: Option<Vec<u8>>) -> Result<Self, WorkError> {
-            Ok(TestOrder {
-                key,
-                status: "new".to_string(),
-            })
+        fn from_state_direct(key: String, state: Option<Vec<u8>>) -> Result<Self, WorkError> {
+            match state {
+                Some(bytes) => {
+                    let data: serde_json::Value = serde_json::from_slice(&bytes)
+                        .map_err(|e| WorkError::Other(e.to_string()))?;
+                    Ok(TestOrder {
+                        key,
+                        status: data["status"].as_str().unwrap_or("new").to_string(),
+                        version: data["version"].as_u64().unwrap_or(0) as u32,
+                    })
+                }
+                None => Ok(TestOrder {
+                    key,
+                    status: "new".to_string(),
+                    version: 0,
+                }),
+            }
         }
 
-        fn handle_command(&mut self, command: StatefulCommand) -> Result<Vec<Event>, WorkError> {
+        fn handle_command(&self, command: StatefulCommand) -> Result<Vec<Event>, WorkError> {
             match command.command_type.as_str() {
                 "create_order" => {
-                    self.status = "created".to_string();
+                    if self.status != "new" {
+                        return Err(WorkError::Other("Order already exists".to_string()));
+                    }
+                    
                     Ok(vec![Event {
                         event_type: "order_created".to_string(),
                         payload: format!("Order {} created", self.key).into_bytes(),
+                        stream: "orders".to_string(),
+                    }])
+                }
+                "confirm_order" => {
+                    if self.status != "created" {
+                        return Err(WorkError::Other("Order must be created first".to_string()));
+                    }
+                    
+                    Ok(vec![Event {
+                        event_type: "order_confirmed".to_string(),
+                        payload: format!("Order {} confirmed", self.key).into_bytes(),
                         stream: "orders".to_string(),
                     }])
                 }
@@ -191,16 +238,35 @@ mod tests {
             }
         }
 
+        fn apply_event(&mut self, event: &Event) -> Result<(), WorkError> {
+            match event.event_type.as_str() {
+                "order_created" => {
+                    self.status = "created".to_string();
+                    self.version += 1;
+                }
+                "order_confirmed" => {
+                    self.status = "confirmed".to_string();
+                    self.version += 1;
+                }
+                _ => return Err(WorkError::Other(format!("Unknown event: {}", event.event_type))),
+            }
+            Ok(())
+        }
+
         fn to_state(&self) -> Result<Option<Vec<u8>>, WorkError> {
-            Ok(Some(self.status.as_bytes().to_vec()))
+            let state = serde_json::json!({
+                "status": self.status,
+                "version": self.version
+            });
+            Ok(Some(serde_json::to_vec(&state).unwrap()))
         }
     }
 
-    // Register the test aggregate with the NEW system
+    // Register the test aggregate
     register_aggregate!(TestOrder);
 
     #[test]
-    fn test_phase2_real_dispatch() {
+    fn test_enhanced_command_event_flow() {
         let command = StatefulCommand {
             aggregate: "test_order".to_string(),
             command_type: "create_order".to_string(),
@@ -209,16 +275,53 @@ mod tests {
             payload: vec![],
         };
 
-        // 🎉 This now calls the REAL aggregate!
+        // Test the enhanced dispatch that returns events AND new state
         let result = dispatch_command("test_order", "order-123".to_string(), None, command);
         
         assert!(result.is_ok());
-        let events = result.unwrap();
+        let (events, new_state) = result.unwrap();
+        
+        // Verify events were generated
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "order_created");
         
-        // Verify the payload contains real data!
-        let payload_str = String::from_utf8(events[0].payload.clone()).unwrap();
-        assert_eq!(payload_str, "Order order-123 created");
+        // Verify state was updated
+        assert!(new_state.is_some());
+        let state_data: serde_json::Value = serde_json::from_slice(&new_state.unwrap()).unwrap();
+        assert_eq!(state_data["status"], "created");
+        assert_eq!(state_data["version"], 1);
+    }
+
+    #[test]
+    fn test_state_persistence_flow() {
+        // Create order
+        let create_command = StatefulCommand {
+            aggregate: "test_order".to_string(),
+            command_type: "create_order".to_string(),
+            key: "order-456".to_string(),
+            state: None,
+            payload: vec![],
+        };
+
+        let (_, state_after_create) = dispatch_command("test_order", "order-456".to_string(), None, create_command).unwrap();
+
+        // Confirm order using the state from the previous command
+        let confirm_command = StatefulCommand {
+            aggregate: "test_order".to_string(),
+            command_type: "confirm_order".to_string(),
+            key: "order-456".to_string(),
+            state: None,
+            payload: vec![],
+        };
+
+        let (events, final_state) = dispatch_command("test_order", "order-456".to_string(), state_after_create, confirm_command).unwrap();
+        
+        // Verify the flow worked
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "order_confirmed");
+        
+        let final_state_data: serde_json::Value = serde_json::from_slice(&final_state.unwrap()).unwrap();
+        assert_eq!(final_state_data["status"], "confirmed");
+        assert_eq!(final_state_data["version"], 2);
     }
 }

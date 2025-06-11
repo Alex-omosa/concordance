@@ -1,5 +1,8 @@
 // concordance/src/lib.rs - Enhanced BaseConfiguration for Phase 3
 
+// ============ MODULES ============
+pub mod persistence;
+
 // ============ RE-EXPORTS FOR NEW AGGREGATE SYSTEM ============
 
 // Re-export core types and traits
@@ -13,6 +16,9 @@ pub use concordance_derive::Aggregate;
 
 // Re-export the entire concordance_core crate for derive macro usage
 pub use concordance_core;
+
+// Re-export persistence types
+pub use persistence::EntityState;
 
 // ============ ENHANCED CONFIGURATION WITH ENV SUPPORT ============
 

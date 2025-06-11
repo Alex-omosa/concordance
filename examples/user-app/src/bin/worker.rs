@@ -1,17 +1,18 @@
-// examples/user-app/src/bin/worker.rs - Fixed Standalone Command Worker
+// examples/user-app/src/bin/worker.rs - Enhanced Worker with State Persistence
 
 use concordance::{
-    Aggregate, AggregateImpl, BaseConfiguration, Event, StatefulCommand, WorkError,
+    Aggregate, AggregateImpl, BaseConfiguration, Event, StatefulCommand, WorkError, EntityState,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{info, error, Level};
+use tracing::{info, error, warn, Level};
 use futures::StreamExt;
 use async_nats::jetstream::{
     consumer::pull::{Config as PullConfig},
     Context, AckKind,
 };
 
-// Import your business aggregates (same as before)
+// ============ ENHANCED BUSINESS AGGREGATES ============
+
 #[derive(Debug, Serialize, Deserialize, Aggregate)]
 #[aggregate(name = "order")]
 pub struct OrderAggregate {
@@ -20,6 +21,7 @@ pub struct OrderAggregate {
     pub total: f64,
     pub status: OrderStatus,
     pub items: Vec<OrderItem>,
+    pub version: u32, // For optimistic concurrency
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -45,50 +47,50 @@ impl AggregateImpl for OrderAggregate {
     fn from_state_direct(key: String, state: Option<Vec<u8>>) -> Result<Self, WorkError> {
         match state {
             Some(bytes) => {
-                info!("🔄 Restoring OrderAggregate from {} bytes", bytes.len());
+                info!("Restoring OrderAggregate from {} bytes", bytes.len());
                 serde_json::from_slice(&bytes)
                     .map_err(|e| WorkError::Other(format!("Deserialize failed: {}", e)))
             }
             None => {
-                info!("✨ Creating new OrderAggregate: {}", key);
+                info!("Creating new OrderAggregate: {}", key);
                 Ok(OrderAggregate {
                     key,
                     customer_id: None,
                     total: 0.0,
                     status: OrderStatus::New,
                     items: Vec::new(),
+                    version: 0,
                 })
             }
         }
     }
 
-    fn handle_command(&mut self, command: StatefulCommand) -> Result<Vec<Event>, WorkError> {
-        info!("📨 OrderAggregate[{}] handling: {}", self.key, command.command_type);
+    // ENHANCED: handle_command is now READ-ONLY and doesn't modify state
+    fn handle_command(&self, command: StatefulCommand) -> Result<Vec<Event>, WorkError> {
+        info!("OrderAggregate[{}] v{} handling: {}", self.key, self.version, command.command_type);
         
         match command.command_type.as_str() {
             "create_order" => {
-                let payload: CreateOrderPayload = serde_json::from_slice(&command.payload)
-                    .map_err(|e| WorkError::Other(format!("Invalid payload: {}", e)))?;
-
+                // Business rule validation (read-only)
                 if self.status != OrderStatus::New {
                     return Err(WorkError::Other("Order already exists".to_string()));
                 }
 
-                self.customer_id = Some(payload.customer_id.clone());
-                self.total = payload.total;
-                self.items = payload.items.clone();
-                self.status = OrderStatus::Created;
+                let payload: CreateOrderPayload = serde_json::from_slice(&command.payload)
+                    .map_err(|e| WorkError::Other(format!("Invalid payload: {}", e)))?;
 
-                info!("✅ Order created! Customer: {}, Total: ${:.2}", payload.customer_id, payload.total);
+                // Generate event data
+                let event_data = OrderCreatedEvent {
+                    order_id: self.key.clone(),
+                    customer_id: payload.customer_id,
+                    total: payload.total,
+                    items: payload.items,
+                    version: self.version + 1,
+                };
 
                 Ok(vec![Event {
                     event_type: "order_created".to_string(),
-                    payload: serde_json::to_vec(&OrderCreatedEvent {
-                        order_id: self.key.clone(),
-                        customer_id: payload.customer_id,
-                        total: payload.total,
-                        items: payload.items,
-                    }).unwrap(),
+                    payload: serde_json::to_vec(&event_data).unwrap(),
                     stream: "orders".to_string(),
                 }])
             }
@@ -97,14 +99,14 @@ impl AggregateImpl for OrderAggregate {
                     return Err(WorkError::Other("Order must be created first".to_string()));
                 }
 
-                self.status = OrderStatus::Confirmed;
-                info!("✅ Order {} confirmed!", self.key);
+                let event_data = OrderConfirmedEvent {
+                    order_id: self.key.clone(),
+                    version: self.version + 1,
+                };
 
                 Ok(vec![Event {
                     event_type: "order_confirmed".to_string(),
-                    payload: serde_json::to_vec(&OrderConfirmedEvent {
-                        order_id: self.key.clone(),
-                    }).unwrap(),
+                    payload: serde_json::to_vec(&event_data).unwrap(),
                     stream: "orders".to_string(),
                 }])
             }
@@ -112,12 +114,50 @@ impl AggregateImpl for OrderAggregate {
         }
     }
 
+    // NEW: apply_event modifies the aggregate state based on events
+    fn apply_event(&mut self, event: &Event) -> Result<(), WorkError> {
+        info!("OrderAggregate[{}] applying event: {}", self.key, event.event_type);
+        
+        match event.event_type.as_str() {
+            "order_created" => {
+                let event_data: OrderCreatedEvent = serde_json::from_slice(&event.payload)
+                    .map_err(|e| WorkError::Other(format!("Invalid event payload: {}", e)))?;
+
+                // Apply the state changes
+                self.customer_id = Some(event_data.customer_id);
+                self.total = event_data.total;
+                self.items = event_data.items;
+                self.status = OrderStatus::Created;
+                self.version = event_data.version;
+
+                info!("Order {} created with total ${:.2}", self.key, self.total);
+            }
+            "order_confirmed" => {
+                let event_data: OrderConfirmedEvent = serde_json::from_slice(&event.payload)
+                    .map_err(|e| WorkError::Other(format!("Invalid event payload: {}", e)))?;
+
+                // Apply the state changes
+                self.status = OrderStatus::Confirmed;
+                self.version = event_data.version;
+
+                info!("Order {} confirmed", self.key);
+            }
+            _ => {
+                warn!("Unknown event type: {}", event.event_type);
+                return Err(WorkError::Other(format!("Unknown event: {}", event.event_type)));
+            }
+        }
+        
+        Ok(())
+    }
+
     fn to_state(&self) -> Result<Option<Vec<u8>>, WorkError> {
         Ok(Some(serde_json::to_vec(self).unwrap()))
     }
 }
 
-// Event payloads
+// ============ EVENT PAYLOADS ============
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateOrderPayload {
     pub customer_id: String,
@@ -131,11 +171,13 @@ pub struct OrderCreatedEvent {
     pub customer_id: String,
     pub total: f64,
     pub items: Vec<OrderItem>,
+    pub version: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OrderConfirmedEvent {
     pub order_id: String,
+    pub version: u32,
 }
 
 // Command from NATS
@@ -146,26 +188,33 @@ pub struct RawCommand {
     pub data: serde_json::Value,
 }
 
-// ============ STANDALONE WORKER IMPLEMENTATION ============
+// ============ ENHANCED WORKER WITH STATE PERSISTENCE ============
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
-        // .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
+        .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
         .init();
 
-    info!("🚀 Starting Concordance Command Worker");
-    info!("📦 Registered aggregates: {:?}", concordance::get_registered_aggregates());
+    info!("Starting Enhanced Concordance Worker with State Persistence");
+    info!("Registered aggregates: {:?}", concordance::get_registered_aggregates());
 
     // Get configuration from environment
     let config = BaseConfiguration::default();
-    info!("📡 Connecting to NATS at: {}", config.nats_url);
+    info!("Connecting to NATS at: {}", config.nats_url);
 
     // Connect to NATS and get JetStream context
     let nc = config.get_nats_connection().await?;
     let js = config.get_jetstream_context().await?;
+
+    // Initialize state persistence
+    let state = EntityState::new_from_context(&js).await?;
+    
+    // Health check the state store
+    state.health_check().await?;
+    info!("State persistence initialized and healthy");
 
     // Ensure streams exist
     ensure_streams(&js).await?;
@@ -177,19 +226,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for aggregate_name in aggregates {
         let worker_nc = nc.clone();
         let worker_js = js.clone();
+        let worker_state = state.clone();
         let agg_name = aggregate_name.to_string();
         
         let handle = tokio::spawn(async move {
-            info!("🏃 Starting worker for aggregate: {}", agg_name);
-            if let Err(e) = run_aggregate_worker(worker_nc, worker_js, &agg_name).await {
-                error!("❌ Worker for {} failed: {}", agg_name, e);
+            info!("Starting enhanced worker for aggregate: {}", agg_name);
+            if let Err(e) = run_enhanced_worker(worker_nc, worker_js, worker_state, &agg_name).await {
+                error!("Enhanced worker for {} failed: {}", agg_name, e);
             }
         });
         
         handles.push(handle);
     }
 
-    info!("✅ All workers started. Press Ctrl+C to stop.");
+    info!("All enhanced workers started. Press Ctrl+C to stop.");
 
     // Wait for all workers (they should run forever)
     for handle in handles {
@@ -202,7 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn ensure_streams(js: &Context) -> Result<(), Box<dyn std::error::Error>> {
     use async_nats::jetstream::stream::{Config as StreamConfig, RetentionPolicy, StorageType};
 
-    info!("🔧 Ensuring NATS streams exist...");
+    info!("Ensuring NATS streams exist...");
 
     // Events stream
     js.get_or_create_stream(StreamConfig {
@@ -224,19 +274,20 @@ async fn ensure_streams(js: &Context) -> Result<(), Box<dyn std::error::Error>> 
         ..Default::default()
     }).await?;
 
-    info!("✅ NATS streams ready");
+    info!("NATS streams ready");
     Ok(())
 }
 
-async fn run_aggregate_worker(
+async fn run_enhanced_worker(
     nc: async_nats::Client,
     js: Context,
+    state: EntityState,
     aggregate_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let consumer_name = format!("AGG_CMD_{}", aggregate_name);
     let filter_subject = format!("cc.commands.{}", aggregate_name);
 
-    info!("🔧 Creating consumer '{}' for aggregate '{}'", consumer_name, aggregate_name);
+    info!("Creating enhanced consumer '{}' for aggregate '{}'", consumer_name, aggregate_name);
 
     // Get command stream
     let stream = js.get_stream("CC_COMMANDS").await?;
@@ -248,7 +299,7 @@ async fn run_aggregate_worker(
             PullConfig {
                 durable_name: Some(consumer_name.clone()),
                 name: Some(consumer_name.clone()),
-                description: Some(format!("Commands for {}", aggregate_name)),
+                description: Some(format!("Enhanced commands for {}", aggregate_name)),
                 ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
                 ack_wait: std::time::Duration::from_secs(30),
                 max_deliver: 3,
@@ -260,7 +311,7 @@ async fn run_aggregate_worker(
         .await?;
 
     let mut messages = consumer.messages().await?;
-    info!("✅ Worker for '{}' ready - waiting for commands...", aggregate_name);
+    info!("Enhanced worker for '{}' ready - waiting for commands...", aggregate_name);
 
     while let Some(msg) = messages.next().await {
         match msg {
@@ -269,69 +320,94 @@ async fn run_aggregate_worker(
                 let raw_command: RawCommand = match serde_json::from_slice(&message.payload) {
                     Ok(cmd) => cmd,
                     Err(e) => {
-                        error!("❌ Failed to parse command: {}. Acking and skipping.", e);
+                        error!("Failed to parse command: {}. Acking and skipping.", e);
                         let _ = message.ack().await;
                         continue;
                     }
                 };
 
-                info!("📨 Processing command: {} for key: {}", raw_command.command_type, raw_command.key);
+                info!("Processing command: {} for key: {}", raw_command.command_type, raw_command.key);
 
-                // Create stateful command
-                let stateful_command = StatefulCommand {
-                    aggregate: aggregate_name.to_string(),
-                    command_type: raw_command.command_type.to_string(),
-                    key: raw_command.key.to_string(),
-                    state: None, // TODO: Load from state store
-                    payload: serde_json::to_vec(&raw_command.data).unwrap(),
-                };
-
-                // Dispatch to aggregate using the registry system! 🎉
-                match concordance::dispatch_command(
-                    aggregate_name,
-                    raw_command.key.clone(),
-                    None, // TODO: Load state
-                    stateful_command,
-                ) {
-                    Ok(events) => {
-                        info!("✅ Command produced {} events", events.len());
-
-                        // Publish events
-                        let mut success = true;
-                        for event in events {
-                            if let Err(e) = publish_event(&nc, event).await {
-                                error!("❌ Failed to publish event: {}", e);
-                                success = false;
-                                break;
-                            }
-                        }
-
-                        if success {
-                            // Ack the command only if all events were published successfully
-                            if let Err(e) = message.ack().await {
-                                error!("❌ Failed to ack command: {}", e);
-                            }
+                // ENHANCED FLOW: Load state, process command with events, save state
+                match process_command_with_state(&state, &nc, aggregate_name, raw_command).await {
+                    Ok(_) => {
+                        // Ack the command only if everything succeeded
+                        if let Err(e) = message.ack().await {
+                            error!("Failed to ack command: {}", e);
                         } else {
-                            // Nack the command if event publishing failed
-                            if let Err(e) = message.ack_with(AckKind::Nak(None)).await {
-                                error!("❌ Failed to nack command: {}", e);
-                            }
+                            info!("Command processed successfully");
                         }
                     }
                     Err(e) => {
-                        error!("❌ Command processing failed: {:?}", e);
+                        error!("Command processing failed: {:?}", e);
                         // Nack the command so it can be retried
                         if let Err(nack_err) = message.ack_with(AckKind::Nak(None)).await {
-                            error!("❌ Failed to nack command: {}", nack_err);
+                            error!("Failed to nack command: {}", nack_err);
                         }
                     }
                 }
             }
             Err(e) => {
-                error!("❌ Error receiving message: {}. Will continue...", e);
+                error!("Error receiving message: {}. Will continue...", e);
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
+    }
+
+    Ok(())
+}
+
+// ENHANCED: Full command processing with state persistence
+async fn process_command_with_state(
+    state: &EntityState,
+    nc: &async_nats::Client,
+    aggregate_name: &str,
+    raw_command: RawCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let key = &raw_command.key;
+    
+    // Step 1: Load current state from NATS KV
+    info!("Loading state for {}.{}", aggregate_name, key);
+    let current_state = state.fetch_state(aggregate_name, key).await?;
+    
+    if let Some(ref state_bytes) = current_state {
+        info!("Found existing state ({} bytes)", state_bytes.len());
+    } else {
+        info!("No existing state found - will create new aggregate");
+    }
+
+    // Step 2: Create StatefulCommand
+    let stateful_command = StatefulCommand {
+        aggregate: aggregate_name.to_string(),
+        command_type: raw_command.command_type,
+        key: key.clone(),
+        state: None, // Not used in enhanced flow
+        payload: serde_json::to_vec(&raw_command.data)?,
+    };
+
+    // Step 3: Use enhanced dispatch that handles command → events → state update
+    info!("Dispatching command using enhanced flow");
+    let (events, new_state) = concordance::dispatch_command(
+        aggregate_name,
+        key.clone(),
+        current_state,
+        stateful_command,
+    ).map_err(|e| format!("Enhanced dispatch failed: {}", e))?;
+
+    info!("Enhanced dispatch produced {} events", events.len());
+
+    // Step 4: Persist the new state to NATS KV
+    if let Some(state_bytes) = new_state {
+        info!("Saving updated state ({} bytes)", state_bytes.len());
+        let revision = state.write_state(aggregate_name, key, state_bytes).await?;
+        info!("State saved with revision: {}", revision);
+    } else {
+        info!("No state to persist (aggregate may have been deleted)");
+    }
+
+    // Step 5: Publish all events to NATS
+    for event in events {
+        publish_event(nc, event).await?;
     }
 
     Ok(())
@@ -343,7 +419,7 @@ async fn publish_event(nc: &async_nats::Client, event: Event) -> Result<(), Box<
     let cloud_event = serde_json::json!({
         "specversion": "1.0",
         "type": event.event_type,
-        "source": "concordance-worker",
+        "source": "concordance-enhanced-worker",
         "id": uuid::Uuid::new_v4().to_string(),
         "time": chrono::Utc::now().to_rfc3339(),
         "datacontenttype": "application/json",
@@ -353,6 +429,6 @@ async fn publish_event(nc: &async_nats::Client, event: Event) -> Result<(), Box<
     let payload = serde_json::to_vec(&cloud_event)?;
     nc.publish(subject, payload.into()).await?;
     
-    info!("📤 Published event: {}", event.event_type);
+    info!("Published event: {}", event.event_type);
     Ok(())
 }
