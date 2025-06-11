@@ -1,1 +1,1 @@
-nats pub cc.commands.order "{\`"command_type\`":\`"create_order\`",\`"key\`":\`"order-456\`",\`"data\`":{\`"customer_id\`":\`"cust-789\`",\`"total\`":150.99,\`"items\`":[{\`"name\`":\`"Widget\`",\`"quantity\`":2,\`"price\`":75.99}]}}"
+nats pub cc.commands.order "{\`"command_type\`":\`"create_order\`",\`"key\`":\`"order-456\`",\`"data\`":{\`"customer_id\`":\`"cust-789\`",\`"total\`":151.98,\`"items\`":[{\`"name\`":\`"Widget\`",\`"quantity\`":2,\`"price\`":75.99}]}}"
