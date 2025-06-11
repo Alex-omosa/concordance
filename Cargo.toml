@@ -1,30 +1,26 @@
-[package]
-name = "concordance"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = [
+    "concordance-core",
+    "concordance-derive", 
+    "concordance",
+    "examples/user-app"
+]
 
-# This makes it a library crate
-[lib]
-name = "concordance"
-path = "src/lib.rs"
-
-[dependencies]
-async-nats = "0.41.0"
+# Optional: shared dependencies across workspace
+[workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-futures = "0.3"
 tokio = { version = "1.0", features = ["full"] }
-tracing = "0.1.41"
-async-trait = "0.1.88"
-futures-util = "0.3.31"
-tracing-futures = "0.2.5"
-cloudevents-sdk = "0.8.0"
-case = "1.0.0"
-anyhow = "1.0.98"
-chrono = "0.4.41"
-uuid = "1.17.0"
-serde_bytes = "0.11.17"
+tracing = "0.1"
+anyhow = "1.0"
+async-trait = "0.1"
 
-[dev-dependencies]
-tokio-test = "0.4"
+# This helps with build times and ensures consistent versions
+[profile.dev]
+opt-level = 0
+debug = true
 
+[profile.release]
+opt-level = 3
+lto = true

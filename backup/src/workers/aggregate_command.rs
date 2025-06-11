@@ -8,7 +8,7 @@ use crate::natsclient::AckableMessage;
 use crate::state::EntityState;
 use async_nats::jetstream::Context;
 
-use crate::eventsourcing::{Event, StatefulCommand};
+use crate::eventsourcing::{Event, StateAck, StatefulCommand};
 
 // Import aggregate implementations from separate module
 use crate::aggregates::{
@@ -22,6 +22,7 @@ pub trait AggregateImpl: Send + Sync + Sized {
     const NAME: &'static str;
     fn from_state_direct(key: String, state: Option<Vec<u8>>) -> Result<Self, WorkError>;
     fn handle_command(&mut self, command: StatefulCommand) -> Result<Vec<Event>, WorkError>;
+    fn apply_event(&mut self, event: Event) -> Result<StateAck, WorkError>;
     fn to_state(&self) -> Result<Option<Vec<u8>>, WorkError>;
 }
 
