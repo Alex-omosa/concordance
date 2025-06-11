@@ -1,7 +1,7 @@
 // concordance/src/workers/aggregate_command.rs - Phase 3 NATS Integration
 
 use async_trait::async_trait;
-use tracing::{debug, error, info, instrument, trace};
+use tracing::{debug, error, info, instrument, trace, warn};
 use serde::{Deserialize, Serialize};
 use futures::StreamExt;
 use async_nats::jetstream::{
@@ -12,6 +12,11 @@ use async_nats::jetstream::{
 
 // Import the new dispatch system
 use crate::{dispatch_command, StatefulCommand, Event, WorkError, InterestDeclaration, ActorRole};
+
+use crate::{
+    cloudevents::{ConcordanceCloudEvent, create_command_cloudevent, create_event_cloudevent},
+    observability::{CorrelationContext, SpanBuilder, Metrics, OperationLogger},
+};
 
 // ============ NATS MESSAGE TYPES ============
 
@@ -67,19 +72,19 @@ impl<T> std::ops::DerefMut for AckableMessage<T> {
 pub struct AggregateCommandWorker {
     pub nc: async_nats::Client,
     pub context: Context,
-    pub interest: InterestDeclaration,
+    pub metrics: Metrics,
 }
 
 impl AggregateCommandWorker {
     pub fn new(
         nc: async_nats::Client,
         context: Context,
-        interest: InterestDeclaration,
+        metrics: Metrics,
     ) -> Self {
-        Self {
+        AggregateCommandWorker {
             nc,
             context,
-            interest,
+            metrics,
         }
     }
 
@@ -152,7 +157,15 @@ impl AggregateCommandWorker {
                     };
 
                     // Process the command
-                    if let Err(e) = self.handle_command(&mut ackable_msg).await {
+                    if let Err(e) = self.process_command(StatefulCommand {
+                        aggregate: self.interest.entity_name.to_string(),
+                        command_type: ackable_msg.command_type.clone(),
+                        key: ackable_msg.key.clone(),
+                        state: None,
+                        payload: serde_json::to_vec(&ackable_msg.data).map_err(|e| {
+                            WorkError::Other(format!("Failed to serialize command payload: {}", e))
+                        })?,
+                    }).await {
                         error!("Failed to handle command: {:?}", e);
                         ackable_msg.nack().await;
                     }
@@ -168,90 +181,161 @@ impl AggregateCommandWorker {
         Ok(())
     }
 
-    /// Handle a single command using the new dispatch system
-    #[instrument(level = "debug", skip_all, fields(entity_name = self.interest.entity_name))]
-    async fn handle_command(&self, message: &mut AckableMessage<RawCommand>) -> Result<(), WorkError> {
-        debug!("📨 Handling command: {} for key: {}", message.command_type, message.key);
+    #[instrument(skip(self, message), fields(
+        command_type = %message.command_type,
+        aggregate = %message.aggregate,
+        key = %message.key
+    ))]
+    pub async fn process_command(&self, message: StatefulCommand) -> Result<()> {
+        let start_time = std::time::Instant::now();
         
-        // Step 1: Load existing state (simplified for Phase 3 - no state persistence yet)
-        let state: Option<Vec<u8>> = None; // TODO: Integrate with state store in Phase 3.1
-        
-        // Step 2: Create StatefulCommand from RawCommand
-        let stateful_command = StatefulCommand {
-            aggregate: self.interest.entity_name.to_string(),
-            command_type: message.command_type.to_string(),
-            key: message.key.to_string(),
-            state: None,
-            payload: serde_json::to_vec(&message.data).map_err(|e| {
-                WorkError::Other(format!("Failed to serialize command payload: {}", e))
-            })?,
-        };
-
-        // Step 3: 🎉 USE THE NEW DISPATCH SYSTEM!
-        trace!("🚀 Dispatching command {} to aggregate {}", 
-               stateful_command.command_type, 
-               self.interest.entity_name);
-        
-        let outbound_events = dispatch_command(
-            &self.interest.entity_name,
+        // Create correlation context for tracing
+        let correlation_ctx = CorrelationContext::new(
+            message.aggregate.clone(),
             message.key.clone(),
-            state,
-            stateful_command,
-        ).map_err(|e| {
-            error!("Aggregate dispatch failed: {:?}", e);
-            WorkError::Other(format!("Dispatch failed: {}", e))
-        })?;
+            message.command_type.clone(),
+        );
 
-        trace!("✅ Command produced {} events", outbound_events.len());
+        // Create command CloudEvent with trace context
+        let cloud_event = create_command_cloudevent(&message, Some(correlation_ctx.clone()))?;
+        
+        // Create span for command processing
+        let span = SpanBuilder::new(correlation_ctx.clone()).command_processing();
+        let _guard = span.enter();
 
-        // Step 4: Publish all resulting events to NATS
+        OperationLogger::command_processing(&correlation_ctx);
+
+        // Process the command and get resulting events
+        let outbound_events = self.handle_command(&message).await?;
+        
+        // Record metrics
+        self.metrics.record_command_processed(&correlation_ctx.correlation_id);
+        self.metrics.record_processing_time(
+            &correlation_ctx.correlation_id,
+            start_time.elapsed()
+        );
+
+        // Publish events
         for event in outbound_events {
             let event_type = event.event_type.clone();
-            if let Err(e) = self.publish_event(event).await {
+            if let Err(e) = self.publish_event(event, &correlation_ctx).await {
                 error!("Failed to publish event '{}': {:?}", event_type, e);
-                // NACK the command so it can be retried
+                self.metrics.record_error(&correlation_ctx.correlation_id, "event_publish");
                 return Err(WorkError::Other(format!("Failed to publish event: {}", e)));
             }
         }
-
-        // Step 5: ACK the command only after all events are published
-        message.ack().await.map_err(|e| {
-            WorkError::Other(format!("Failed to ack message: {}", e))
-        })?;
 
         debug!("✅ Command processing complete for key: {}", message.key);
         Ok(())
     }
 
-    /// Publish an event to the NATS events stream
-    async fn publish_event(&self, event: Event) -> Result<(), async_nats::Error> {
-        let subject = format!("cc.events.{}", event.event_type);
+    #[instrument(skip(self, command), fields(
+        command_type = %command.command_type,
+        aggregate = %command.aggregate,
+        key = %command.key
+    ))]
+    async fn handle_command(&self, command: &StatefulCommand) -> Result<Vec<Event>, WorkError> {
+        // Load aggregate state
+        let state = self.load_state(command).await?;
         
-        // Convert to CloudEvent format for better compatibility
-        let cloud_event = serde_json::json!({
-            "specversion": "1.0",
-            "type": event.event_type,
-            "source": "concordance",
-            "id": uuid::Uuid::new_v4().to_string(),
-            "time": chrono::Utc::now().to_rfc3339(),
-            "datacontenttype": "application/json",
-            "data": serde_json::from_slice::<serde_json::Value>(&event.payload).unwrap_or_default(),
-            "subject": event.stream,
-        });
+        // Create aggregate instance
+        let mut aggregate = self.create_aggregate(command, state)?;
+        
+        // Handle command and get events
+        let events = aggregate.handle_command(command.clone())?;
+        
+        // Apply events to aggregate
+        for event in &events {
+            aggregate.apply_event(event)?;
+        }
+        
+        // Persist new state
+        if let Some(new_state) = aggregate.to_state()? {
+            self.persist_state(command, new_state).await?;
+        }
+        
+        Ok(events)
+    }
 
-        let payload = serde_json::to_vec(&cloud_event)
-            .map_err(|e| async_nats::Error::new(
-                async_nats::error::ErrorKind::Other, 
-                Some(format!("Failed to serialize event: {}", e))
-            ))?;
+    #[instrument(skip(self, event, correlation_ctx), fields(
+        event_type = %event.event_type,
+        aggregate = %correlation_ctx.aggregate_type,
+        key = %correlation_ctx.aggregate_key
+    ))]
+    async fn publish_event(&self, event: Event, correlation_ctx: &CorrelationContext) -> Result<()> {
+        let event_type = event.event_type.clone();
+        let publish_span = SpanBuilder::new(correlation_ctx.clone()).event_publish(&event_type);
+        let _guard = publish_span.enter();
 
-        trace!("📤 Publishing event '{}' to subject '{}'", event.event_type, subject);
+        // Create event CloudEvent with trace context
+        let cloud_event = create_event_cloudevent(
+            &event,
+            &correlation_ctx.aggregate_type,
+            &correlation_ctx.aggregate_key,
+            0, // Version will be updated by the event store
+            Some(correlation_ctx.clone()),
+        )?;
+
+        // Serialize for NATS
+        let (payload, headers) = crate::cloudevents::serialize_for_nats(&cloud_event.cloud_event)?;
         
-        self.nc.publish(subject, payload.into()).await?;
-        
-        trace!("✅ Event '{}' published successfully", event.event_type);
+        // Create NATS headers
+        let mut nats_headers = async_nats::HeaderMap::new();
+        for (key, value) in headers {
+            nats_headers.insert(key, value);
+        }
+
+        // Publish to NATS
+        let subject = format!("cc.events.{}", event_type);
+        self.nc.publish_with_headers(subject, nats_headers, payload.into()).await?;
+
+        // Record metrics
+        self.metrics.record_event_published(&correlation_ctx.correlation_id, &event_type);
+        self.metrics.record_nats_interaction(&correlation_ctx.correlation_id, "publish");
+
+        OperationLogger::nats_interaction(
+            correlation_ctx,
+            "publish",
+            &format!("cc.events.{}", event_type)
+        );
+
+        trace!("✅ Event '{}' published successfully", event_type);
         Ok(())
     }
+
+    #[instrument(skip(self, command), fields(
+        aggregate = %command.aggregate,
+        key = %command.key
+    ))]
+    async fn load_state(&self, command: &StatefulCommand) -> Result<Option<Vec<u8>>, WorkError> {
+        // Implementation for loading state
+        Ok(None)
+    }
+
+    #[instrument(skip(self, command, state), fields(
+        aggregate = %command.aggregate,
+        key = %command.key
+    ))]
+    fn create_aggregate(&self, command: &StatefulCommand, state: Option<Vec<u8>>) -> Result<Box<dyn AggregateImpl>, WorkError> {
+        // Implementation for creating aggregate
+        unimplemented!()
+    }
+
+    #[instrument(skip(self, command, state), fields(
+        aggregate = %command.aggregate,
+        key = %command.key
+    ))]
+    async fn persist_state(&self, command: &StatefulCommand, state: Vec<u8>) -> Result<(), WorkError> {
+        // Implementation for persisting state
+        Ok(())
+    }
+}
+
+// Required trait for aggregate implementation
+pub trait AggregateImpl: Send + Sync {
+    fn handle_command(&mut self, command: StatefulCommand) -> Result<Vec<Event>, WorkError>;
+    fn apply_event(&mut self, event: &Event) -> Result<(), WorkError>;
+    fn to_state(&self) -> Result<Option<Vec<u8>>, WorkError>;
 }
 
 // ============ CONVENIENCE FUNCTIONS ============
@@ -271,7 +355,7 @@ pub async fn start_aggregate_worker(
         interest_constraint: crate::InterestConstraint::Commands,
     };
 
-    let worker = AggregateCommandWorker::new(nats_client, js_context, interest);
+    let worker = AggregateCommandWorker::new(nats_client, js_context, Metrics::new());
     worker.start().await
 }
 

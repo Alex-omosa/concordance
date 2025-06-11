@@ -1,11 +1,18 @@
 // concordance/src/observability.rs - OpenTelemetry Observability
 
 use std::sync::Arc;
-use tracing::{info_span, Instrument, Span};
+use tracing::{info_span, Instrument, Span, Level};
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 use chrono::Utc;
 use anyhow::Result;
+use std::time::Duration;
+use opentelemetry::{
+    metrics::{Counter, Histogram, Meter},
+    KeyValue,
+};
+use opentelemetry_sdk::metrics::MeterProvider;
+use tracing_subscriber::{util::SubscriberInitExt, EnvFilter};
 
 // ============ CORRELATION CONTEXT ============
 
@@ -26,6 +33,8 @@ pub struct CorrelationContext {
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// NATS subject the message came from
     pub source_subject: Option<String>,
+    /// Parent span ID for distributed tracing
+    pub parent_span_id: Option<String>,
 }
 
 impl CorrelationContext {
@@ -38,6 +47,7 @@ impl CorrelationContext {
             operation_type,
             started_at: Utc::now(),
             source_subject: None,
+            parent_span_id: None,
         }
     }
 
@@ -46,225 +56,301 @@ impl CorrelationContext {
         self.source_subject = subject;
         self
     }
+
+    pub fn with_parent_span(mut self, span_id: String) -> Self {
+        self.parent_span_id = Some(span_id);
+        self
+    }
 }
 
 // ============ SPAN BUILDER ============
 
 /// Builder for creating consistent tracing spans across layers with OpenTelemetry attributes
-pub struct SpanBuilder;
+pub struct SpanBuilder {
+    pub correlation_ctx: CorrelationContext,
+}
 
 impl SpanBuilder {
-    /// Create a span for NATS message ingestion
-    pub fn nats_ingestion(ctx: &CorrelationContext) -> Span {
-        info_span!(
-            "nats.message.ingestion",
-            // OpenTelemetry semantic conventions
-            "messaging.system" = "nats",
-            "messaging.operation" = "receive",
-            "messaging.destination" = ?ctx.source_subject,
-            "messaging.message_id" = ?ctx.nats_message_id,
-            
-            // Concordance-specific attributes
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "concordance.aggregate.type" = %ctx.aggregate_type,
-            "concordance.aggregate.key" = %ctx.aggregate_key,
-            "concordance.operation.type" = %ctx.operation_type,
-            
-            // Standard attributes
-            "service.name" = "concordance-worker",
-            "operation.name" = "nats_message_receive",
-        )
+    pub fn new(correlation_ctx: CorrelationContext) -> Self {
+        Self { correlation_ctx }
     }
 
-    /// Create a span for command processing in the worker layer
-    pub fn worker_processing(ctx: &CorrelationContext) -> Span {
-        info_span!(
-            "worker.command.processing",
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "concordance.aggregate.type" = %ctx.aggregate_type,
-            "concordance.aggregate.key" = %ctx.aggregate_key,
-            "concordance.command.type" = %ctx.operation_type,
-            "service.name" = "concordance-worker",
-            "operation.name" = "command_processing",
-            "layer" = "worker"
-        )
+    pub fn command_processing(&self) -> Span {
+        let span = tracing::info_span!(
+            "command_processing",
+            correlation_id = %self.correlation_ctx.correlation_id,
+            aggregate_type = %self.correlation_ctx.aggregate_type,
+            aggregate_key = %self.correlation_ctx.aggregate_key,
+            operation_type = %self.correlation_ctx.operation_type,
+            source_subject = ?self.correlation_ctx.source_subject,
+            parent_span_id = ?self.correlation_ctx.parent_span_id
+        );
+        span
     }
 
-    /// Create a span for state loading operations
-    pub fn state_load(ctx: &CorrelationContext) -> Span {
-        info_span!(
-            "state.load",
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "concordance.aggregate.type" = %ctx.aggregate_type,
-            "concordance.aggregate.key" = %ctx.aggregate_key,
-            "service.name" = "concordance-worker",
-            "operation.name" = "state_load",
-            "layer" = "persistence",
-            "db.operation" = "select",
-            "db.system" = "nats-kv"
-        )
+    pub fn event_processing(&self) -> Span {
+        let span = tracing::info_span!(
+            "event_processing",
+            correlation_id = %self.correlation_ctx.correlation_id,
+            aggregate_type = %self.correlation_ctx.aggregate_type,
+            aggregate_key = %self.correlation_ctx.aggregate_key,
+            operation_type = %self.correlation_ctx.operation_type,
+            source_subject = ?self.correlation_ctx.source_subject,
+            parent_span_id = ?self.correlation_ctx.parent_span_id
+        );
+        span
     }
 
-    /// Create a span for aggregate command handling (domain layer)
-    pub fn domain_command_handling(ctx: &CorrelationContext) -> Span {
-        info_span!(
-            "domain.command.handle",
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "concordance.aggregate.type" = %ctx.aggregate_type,
-            "concordance.aggregate.key" = %ctx.aggregate_key,
-            "concordance.command.type" = %ctx.operation_type,
-            "service.name" = "concordance-worker",
-            "operation.name" = "domain_command_handle",
-            "layer" = "domain"
-        )
+    pub fn state_persist(&self) -> Span {
+        let span = tracing::info_span!(
+            "state_persist",
+            correlation_id = %self.correlation_ctx.correlation_id,
+            aggregate_type = %self.correlation_ctx.aggregate_type,
+            aggregate_key = %self.correlation_ctx.aggregate_key,
+            operation_type = %self.correlation_ctx.operation_type,
+            source_subject = ?self.correlation_ctx.source_subject,
+            parent_span_id = ?self.correlation_ctx.parent_span_id
+        );
+        span
     }
 
-    /// Create a span for event application in domain
-    pub fn domain_event_apply(ctx: &CorrelationContext, event_type: &str) -> Span {
-        info_span!(
-            "domain.event.apply",
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "concordance.aggregate.type" = %ctx.aggregate_type,
-            "concordance.aggregate.key" = %ctx.aggregate_key,
-            "concordance.event.type" = %event_type,
-            "service.name" = "concordance-worker",
-            "operation.name" = "domain_event_apply",
-            "layer" = "domain"
-        )
+    pub fn state_load(&self) -> Span {
+        let span = tracing::info_span!(
+            "state_load",
+            correlation_id = %self.correlation_ctx.correlation_id,
+            aggregate_type = %self.correlation_ctx.aggregate_type,
+            aggregate_key = %self.correlation_ctx.aggregate_key,
+            operation_type = %self.correlation_ctx.operation_type,
+            source_subject = ?self.correlation_ctx.source_subject,
+            parent_span_id = ?self.correlation_ctx.parent_span_id
+        );
+        span
     }
 
-    /// Create a span for state persistence
-    pub fn state_persist(ctx: &CorrelationContext) -> Span {
-        info_span!(
-            "state.persist",
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "concordance.aggregate.type" = %ctx.aggregate_type,
-            "concordance.aggregate.key" = %ctx.aggregate_key,
-            "service.name" = "concordance-worker",
-            "operation.name" = "state_persist",
-            "layer" = "persistence",
-            "db.operation" = "update",
-            "db.system" = "nats-kv"
-        )
+    pub fn domain_command_handling(&self) -> Span {
+        let span = tracing::info_span!(
+            "domain_command_handling",
+            correlation_id = %self.correlation_ctx.correlation_id,
+            aggregate_type = %self.correlation_ctx.aggregate_type,
+            aggregate_key = %self.correlation_ctx.aggregate_key,
+            operation_type = %self.correlation_ctx.operation_type,
+            source_subject = ?self.correlation_ctx.source_subject,
+            parent_span_id = ?self.correlation_ctx.parent_span_id
+        );
+        span
     }
 
-    /// Create a span for event publishing
-    pub fn event_publish(ctx: &CorrelationContext, event_type: &str) -> Span {
-        info_span!(
-            "event.publish",
-            "messaging.system" = "nats",
-            "messaging.operation" = "publish",
-            "messaging.destination" = format!("cc.events.{}", event_type),
-            
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "concordance.aggregate.type" = %ctx.aggregate_type,
-            "concordance.aggregate.key" = %ctx.aggregate_key,
-            "concordance.event.type" = %event_type,
-            
-            "service.name" = "concordance-worker",
-            "operation.name" = "event_publish",
-            "layer" = "infrastructure"
-        )
+    pub fn event_publish(&self, event_type: &str) -> Span {
+        let span = tracing::info_span!(
+            "event_publish",
+            correlation_id = %self.correlation_ctx.correlation_id,
+            aggregate_type = %self.correlation_ctx.aggregate_type,
+            aggregate_key = %self.correlation_ctx.aggregate_key,
+            operation_type = %self.correlation_ctx.operation_type,
+            source_subject = ?self.correlation_ctx.source_subject,
+            parent_span_id = ?self.correlation_ctx.parent_span_id,
+            event_type = %event_type
+        );
+        span
     }
 
-    /// Create a span for message acknowledgment
-    pub fn message_ack(ctx: &CorrelationContext, success: bool) -> Span {
-        info_span!(
-            "nats.message.ack",
-            "messaging.system" = "nats",
-            "messaging.operation" = if success { "ack" } else { "nack" },
-            
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "concordance.ack.success" = %success,
-            
-            "service.name" = "concordance-worker",
-            "operation.name" = "message_ack",
-            "layer" = "infrastructure"
-        )
+    pub fn message_ack(&self, success: bool) -> Span {
+        let span = tracing::info_span!(
+            "message_ack",
+            correlation_id = %self.correlation_ctx.correlation_id,
+            aggregate_type = %self.correlation_ctx.aggregate_type,
+            aggregate_key = %self.correlation_ctx.aggregate_key,
+            operation_type = %self.correlation_ctx.operation_type,
+            source_subject = ?self.correlation_ctx.source_subject,
+            parent_span_id = ?self.correlation_ctx.parent_span_id,
+            success = %success
+        );
+        span
+    }
+
+    pub fn worker_processing(&self) -> Span {
+        let span = tracing::info_span!(
+            "worker_processing",
+            correlation_id = %self.correlation_ctx.correlation_id,
+            aggregate_type = %self.correlation_ctx.aggregate_type,
+            aggregate_key = %self.correlation_ctx.aggregate_key,
+            operation_type = %self.correlation_ctx.operation_type,
+            source_subject = ?self.correlation_ctx.source_subject,
+            parent_span_id = ?self.correlation_ctx.parent_span_id
+        );
+        span
+    }
+}
+
+// ============ METRICS ============
+
+/// Metrics for monitoring system performance
+#[derive(Clone)]
+pub struct Metrics {
+    commands_processed: Counter<u64>,
+    events_published: Counter<u64>,
+    processing_time: Histogram<f64>,
+    error_count: Counter<u64>,
+    state_operations: Counter<u64>,
+    nats_interactions: Counter<u64>,
+}
+
+impl Metrics {
+    pub fn new(meter: Meter) -> Self {
+        Self {
+            commands_processed: meter.u64_counter("concordance.commands.processed")
+                .with_description("Number of commands processed")
+                .init(),
+            events_published: meter.u64_counter("concordance.events.published")
+                .with_description("Number of events published")
+                .init(),
+            processing_time: meter.f64_histogram("concordance.processing.time")
+                .with_description("Time taken to process operations")
+                .init(),
+            error_count: meter.u64_counter("concordance.errors")
+                .with_description("Number of errors encountered")
+                .init(),
+            state_operations: meter.u64_counter("concordance.state.operations")
+                .with_description("Number of state operations performed")
+                .init(),
+            nats_interactions: meter.u64_counter("concordance.nats.interactions")
+                .with_description("Number of NATS interactions")
+                .init(),
+        }
+    }
+
+    pub fn record_command_processed(&self, correlation_id: &str) {
+        self.commands_processed.add(1, &[
+            KeyValue::new("correlation_id", correlation_id.to_string()),
+        ]);
+    }
+
+    pub fn record_event_published(&self, correlation_id: &str, event_type: &str) {
+        self.events_published.add(1, &[
+            KeyValue::new("correlation_id", correlation_id.to_string()),
+            KeyValue::new("event_type", event_type.to_string()),
+        ]);
+    }
+
+    pub fn record_processing_time(&self, correlation_id: &str, duration: Duration) {
+        self.processing_time.record(duration.as_secs_f64(), &[
+            KeyValue::new("correlation_id", correlation_id.to_string()),
+        ]);
+    }
+
+    pub fn record_error(&self, correlation_id: &str, error_type: &str) {
+        self.error_count.add(1, &[
+            KeyValue::new("correlation_id", correlation_id.to_string()),
+            KeyValue::new("error_type", error_type.to_string()),
+        ]);
+    }
+
+    pub fn record_state_operation(&self, correlation_id: &str, operation_type: &str) {
+        self.state_operations.add(1, &[
+            KeyValue::new("correlation_id", correlation_id.to_string()),
+            KeyValue::new("operation_type", operation_type.to_string()),
+        ]);
+    }
+
+    pub fn record_nats_interaction(&self, correlation_id: &str, interaction_type: &str) {
+        self.nats_interactions.add(1, &[
+            KeyValue::new("correlation_id", correlation_id.to_string()),
+            KeyValue::new("interaction_type", interaction_type.to_string()),
+        ]);
     }
 }
 
 // ============ OPERATION LOGGER ============
 
-/// Structured logger for operation flow with OpenTelemetry attributes
+/// Helper for logging operations with consistent format
 pub struct OperationLogger;
 
 impl OperationLogger {
-    /// Log the start of an operation
-    pub fn operation_started(ctx: &CorrelationContext) {
+    pub fn command_processing(correlation_ctx: &CorrelationContext) {
         tracing::info!(
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "concordance.aggregate.type" = %ctx.aggregate_type,
-            "concordance.aggregate.key" = %ctx.aggregate_key,
-            "concordance.operation.type" = %ctx.operation_type,
-            "operation.started" = true,
+            correlation_id = %correlation_ctx.correlation_id,
+            aggregate_type = %correlation_ctx.aggregate_type,
+            aggregate_key = %correlation_ctx.aggregate_key,
+            operation_type = %correlation_ctx.operation_type,
+            "Processing command"
+        );
+    }
+
+    pub fn event_processing(correlation_ctx: &CorrelationContext) {
+        tracing::info!(
+            correlation_id = %correlation_ctx.correlation_id,
+            aggregate_type = %correlation_ctx.aggregate_type,
+            aggregate_key = %correlation_ctx.aggregate_key,
+            operation_type = %correlation_ctx.operation_type,
+            "Processing event"
+        );
+    }
+
+    pub fn state_operation(correlation_ctx: &CorrelationContext, operation: &str) {
+        tracing::info!(
+            correlation_id = %correlation_ctx.correlation_id,
+            aggregate_type = %correlation_ctx.aggregate_type,
+            aggregate_key = %correlation_ctx.aggregate_key,
+            operation_type = %correlation_ctx.operation_type,
+            operation = %operation,
+            "State operation"
+        );
+    }
+
+    pub fn nats_interaction(correlation_ctx: &CorrelationContext, interaction: &str, subject: &str) {
+        tracing::info!(
+            correlation_id = %correlation_ctx.correlation_id,
+            aggregate_type = %correlation_ctx.aggregate_type,
+            aggregate_key = %correlation_ctx.aggregate_key,
+            operation_type = %correlation_ctx.operation_type,
+            interaction = %interaction,
+            subject = %subject,
+            "NATS interaction"
+        );
+    }
+
+    pub fn error(correlation_ctx: &CorrelationContext, error: &str) {
+        tracing::error!(
+            correlation_id = %correlation_ctx.correlation_id,
+            aggregate_type = %correlation_ctx.aggregate_type,
+            aggregate_key = %correlation_ctx.aggregate_key,
+            operation_type = %correlation_ctx.operation_type,
+            error = %error,
+            "Error occurred"
+        );
+    }
+
+    pub fn operation_started(correlation_ctx: &CorrelationContext) {
+        tracing::info!(
+            correlation_id = %correlation_ctx.correlation_id,
+            aggregate_type = %correlation_ctx.aggregate_type,
+            aggregate_key = %correlation_ctx.aggregate_key,
+            operation_type = %correlation_ctx.operation_type,
             "Operation started"
         );
     }
 
-    /// Log successful operation completion
-    pub fn operation_completed(ctx: &CorrelationContext, duration_ms: u64, events_generated: usize) {
+    pub fn operation_completed(correlation_ctx: &CorrelationContext, duration_ms: u64, event_count: usize) {
         tracing::info!(
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "concordance.aggregate.type" = %ctx.aggregate_type,
-            "concordance.aggregate.key" = %ctx.aggregate_key,
-            "concordance.operation.type" = %ctx.operation_type,
-            "concordance.operation.duration_ms" = %duration_ms,
-            "concordance.events.generated" = %events_generated,
-            "operation.completed" = true,
-            "Operation completed successfully"
+            correlation_id = %correlation_ctx.correlation_id,
+            aggregate_type = %correlation_ctx.aggregate_type,
+            aggregate_key = %correlation_ctx.aggregate_key,
+            operation_type = %correlation_ctx.operation_type,
+            duration_ms = %duration_ms,
+            event_count = %event_count,
+            "Operation completed"
         );
     }
 
-    /// Log operation failure
-    pub fn operation_failed(ctx: &CorrelationContext, error: &str, duration_ms: u64) {
+    pub fn operation_failed(correlation_ctx: &CorrelationContext, error: &str, duration_ms: u64) {
         tracing::error!(
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "concordance.aggregate.type" = %ctx.aggregate_type,
-            "concordance.aggregate.key" = %ctx.aggregate_key,
-            "concordance.operation.type" = %ctx.operation_type,
-            "concordance.operation.duration_ms" = %duration_ms,
-            "concordance.error.message" = %error,
-            "operation.failed" = true,
+            correlation_id = %correlation_ctx.correlation_id,
+            aggregate_type = %correlation_ctx.aggregate_type,
+            aggregate_key = %correlation_ctx.aggregate_key,
+            operation_type = %correlation_ctx.operation_type,
+            error = %error,
+            duration_ms = %duration_ms,
             "Operation failed"
-        );
-    }
-
-    /// Log state transition
-    pub fn state_transition(ctx: &CorrelationContext, from_version: u32, to_version: u32) {
-        tracing::info!(
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "concordance.aggregate.type" = %ctx.aggregate_type,
-            "concordance.aggregate.key" = %ctx.aggregate_key,
-            "concordance.state.version.from" = %from_version,
-            "concordance.state.version.to" = %to_version,
-            "state.transition" = true,
-            "State transition"
-        );
-    }
-
-    /// Log event generation
-    pub fn event_generated(ctx: &CorrelationContext, event_type: &str, event_size: usize) {
-        tracing::debug!(
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "concordance.aggregate.type" = %ctx.aggregate_type,
-            "concordance.aggregate.key" = %ctx.aggregate_key,
-            "concordance.event.type" = %event_type,
-            "concordance.event.size_bytes" = %event_size,
-            "event.generated" = true,
-            "Event generated"
-        );
-    }
-
-    /// Log NATS interaction
-    pub fn nats_interaction(ctx: &CorrelationContext, operation: &str, subject: &str) {
-        tracing::debug!(
-            "concordance.correlation_id" = %ctx.correlation_id,
-            "messaging.system" = "nats",
-            "messaging.operation" = %operation,
-            "messaging.destination" = %subject,
-            "nats.interaction" = true,
-            "NATS interaction"
         );
     }
 }
@@ -366,10 +452,9 @@ impl OperationMetrics {
         }
     }
 }
-
 // ============ OPENTELEMETRY INITIALIZATION ============
 
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::layer::SubscriberExt;
 
 /// Initialize tracing with OpenTelemetry support
 pub fn init_tracing() -> Result<()> {

@@ -14,9 +14,13 @@ path = "src/main.rs"
 name = "worker"
 path = "src/bin/worker.rs"
 
+[[bin]]
+name = "cloud_events_demo"
+path = "src/bin/cloud_events_demo.rs"
+
 [dependencies]
 # Core Concordance framework
-concordance = { path = "../../concordance" }
+concordance = { path = "../../concordance", features = ["opentelemetry"] }
 
 # Async runtime and utilities
 tokio = { version = "1.0", features = ["full"] }
@@ -26,12 +30,16 @@ futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# Logging
+# Logging and Observability
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = { version = "0.20" }
+opentelemetry-otlp = { version = "0.13" }
+opentelemetry_sdk = { version = "0.20", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.21"
 
 # UUID generation for events
-uuid = { version = "1.0", features = ["v4"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
 
 # Time handling for events
 chrono = { version = "0.4", features = ["serde"] }

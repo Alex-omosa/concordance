@@ -36,7 +36,7 @@ tracing-futures = "0.2.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # CloudEvents support
-cloudevents-sdk = "0.8.0"
+cloudevents-sdk = "=0.8.0"
 
 # OpenTelemetry support (optional but recommended)
 opentelemetry = { version = "0.20", optional = true }

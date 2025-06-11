@@ -582,7 +582,9 @@ async fn run_worker_loop(
                         )
                         .await {
                             Ok(_) => {
-                                let ack_span = SpanBuilder::message_ack(&correlation_ctx, true);
+                                let span_builder = SpanBuilder::new(correlation_ctx.clone());
+                                let ack_span = span_builder.message_ack(true);
+                                
                                 let _guard = ack_span.enter();
                                 
                                 if let Err(e) = message.ack().await {
@@ -600,7 +602,8 @@ async fn run_worker_loop(
                                 let duration_ms = operation_start.elapsed().as_millis() as u64;
                                 OperationLogger::operation_failed(&correlation_ctx, &e.to_string(), duration_ms);
                                 
-                                let ack_span = SpanBuilder::message_ack(&correlation_ctx, false);
+                                let span_builder = SpanBuilder::new(correlation_ctx.clone());
+                                let ack_span = span_builder.message_ack(false);
                                 let _guard = ack_span.enter();
                                 
                                 if let Err(nack_err) = message.ack_with(async_nats::jetstream::AckKind::Nak(None)).await {
@@ -694,7 +697,8 @@ async fn process_command_with_observability(
     correlation_ctx: CorrelationContext,
 ) -> Result<()> {
     // Create root span for entire operation
-    let root_span = SpanBuilder::worker_processing(&correlation_ctx);
+    let span_builder = SpanBuilder::new(correlation_ctx.clone());
+    let root_span = span_builder.worker_processing();
     
     async move {
         let mut metrics = OperationMetrics::new();
@@ -705,7 +709,8 @@ async fn process_command_with_observability(
         let key = &raw_command.key;
         
         // Step 1: Load state with observability
-        let state_span = SpanBuilder::state_load(&correlation_ctx);
+        let span_builder = SpanBuilder::new(correlation_ctx.clone());
+        let state_span = span_builder.state_load();
         let current_state = {
             let _guard = state_span.enter();
             
@@ -740,7 +745,8 @@ async fn process_command_with_observability(
         };
 
         // Step 3: Dispatch command with domain layer observability
-        let dispatch_span = SpanBuilder::domain_command_handling(&correlation_ctx);
+        let span_builder = SpanBuilder::new(correlation_ctx.clone());
+        let dispatch_span = span_builder.domain_command_handling();
         let (events, new_state) = {
             let _guard = dispatch_span.enter();
             
@@ -773,14 +779,15 @@ async fn process_command_with_observability(
         for event in &events {
             let event_size = event.payload.len();
             metrics.add_event_size(event_size);
-            OperationLogger::event_generated(&correlation_ctx, &event.event_type, event_size);
+            OperationLogger::event_processing(&correlation_ctx);
         }
 
         metrics.mark_events_applied();
 
         // Step 4: Persist state with observability
         if let Some(state_bytes) = new_state {
-            let persist_span = SpanBuilder::state_persist(&correlation_ctx);
+            let span_builder = SpanBuilder::new(correlation_ctx.clone());
+            let persist_span = span_builder.state_persist();
             let _guard = persist_span.enter();
             
             let state_size = state_bytes.len();
@@ -805,7 +812,8 @@ async fn process_command_with_observability(
         // Step 5: Publish events with observability
         for event in events {
             let event_type = event.event_type.clone();
-            let publish_span = SpanBuilder::event_publish(&correlation_ctx, &event_type);
+            let span_builder = SpanBuilder::new(correlation_ctx.clone());
+            let publish_span = span_builder.event_publish(&event_type);
             
             let _guard = publish_span.enter();
             
