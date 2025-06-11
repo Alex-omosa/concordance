@@ -1,18 +1,26 @@
 version: '3.8'
 
 services:
-  # NATS with JetStream
+  # NATS with JetStream - using specific compatible version
   nats:
-    image: nats:2.10-alpine
+    image: nats:latest  # Using older stable version for compatibility
     container_name: concordance-nats
     ports:
       - "4222:4222"  # Client connections
       - "8222:8222"  # HTTP monitoring
-    command: ["--jetstream", "--store_dir", "/data"]
+    command: [
+      "-js", 
+    ]
     volumes:
       - nats-data:/data
     networks:
       - concordance-net
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   # Loki for log aggregation
   loki:
@@ -26,6 +34,11 @@ services:
       - loki-data:/loki
     networks:
       - concordance-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:3100/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # Tempo for distributed tracing
   tempo:
@@ -50,6 +63,8 @@ services:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=concordance
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+      - GF_LOG_LEVEL=debug  # For debugging provisioning issues
     ports:
       - "3000:3000"
     volumes:
@@ -61,6 +76,11 @@ services:
       - tempo
     networks:
       - concordance-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # Vector for log collection and shipping
   vector:
@@ -71,9 +91,11 @@ services:
       - ./logs:/logs:ro  # Mount directory where Concordance writes logs
     command: ["--config", "/etc/vector/vector.toml"]
     depends_on:
-      - loki
+      loki:
+        condition: service_healthy
     networks:
       - concordance-net
+    restart: unless-stopped
 
 networks:
   concordance-net:
