@@ -1,17 +1,18 @@
-// examples/user-app/src/bin/worker.rs - Updated with observability
+// examples/user-app/src/bin/worker.rs - Updated with OpenTelemetry observability
 
 use user_app::*;
 use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize structured logging with JSON output
-    concordance::observability::init_tracing();
+    // Initialize OpenTelemetry tracing
+    concordance::observability::init_tracing()?;
 
     tracing::info!(
         service.name = "concordance-worker",
         service.version = env!("CARGO_PKG_VERSION"),
-        "Starting Concordance Production Worker"
+        otel.enabled = cfg!(feature = "opentelemetry"),
+        "Starting Concordance Production Worker with OpenTelemetry"
     );
 
     tracing::info!(
@@ -23,12 +24,17 @@ async fn main() -> Result<()> {
     // Create provider
     let app = match ConcordanceProvider::new().await {
         Ok(provider) => {
-            tracing::info!("Concordance provider initialized successfully");
+            tracing::info!(
+                nats.connected = true,
+                jetstream.enabled = true,
+                "Concordance provider initialized successfully"
+            );
             provider
         }
         Err(e) => {
             tracing::error!(
                 error = %e,
+                initialization.failed = true,
                 "Failed to initialize Concordance provider"
             );
             return Err(e);
@@ -43,12 +49,15 @@ async fn main() -> Result<()> {
                 health.jetstream = ?health.jetstream,
                 health.state_store = ?health.state_store,
                 health.aggregates = ?health.registered_aggregates,
+                health.overall = ?health.overall,
+                system.health_check = "passed",
                 "System health check completed"
             );
         }
         Err(e) => {
             tracing::warn!(
                 error = %e,
+                system.health_check = "failed",
                 "Health check encountered issues"
             );
         }
@@ -62,21 +71,53 @@ async fn main() -> Result<()> {
         nats.subjects.commands = "cc.commands.*",
         nats.subjects.events = "cc.events.*",
         nats.kv.bucket = "CC_STATE",
+        workers.status = "started",
         "All workers started successfully"
     );
 
     // Create a shutdown handler
     let shutdown = tokio::signal::ctrl_c();
     
+    // Wait for either all workers to stop or shutdown signal
     tokio::select! {
-        _ = futures::future::try_join_all(worker_handles) => {
-            tracing::warn!("All workers have stopped");
+        result = futures::future::try_join_all(worker_handles) => {
+            match result {
+                Ok(_) => {
+                    tracing::info!(
+                        workers.status = "completed",
+                        "All workers have completed normally"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        workers.status = "failed",
+                        "Worker error occurred"
+                    );
+                }
+            }
         }
         _ = shutdown => {
-            tracing::info!("Received shutdown signal");
+            tracing::info!(
+                shutdown.signal = "received",
+                workers.status = "stopping",
+                "Received shutdown signal"
+            );
         }
     }
 
-    tracing::info!("Worker shutting down gracefully");
+    tracing::info!(
+        service.shutdown = "starting",
+        "Worker shutting down gracefully"
+    );
+
+    // Shutdown telemetry gracefully
+    concordance::observability::shutdown_telemetry();
+
+    tracing::info!(
+        service.shutdown = "complete",
+        "Worker shutdown complete"
+    );
+
     Ok(())
 }

@@ -12,34 +12,46 @@ path = "src/lib.rs"
 concordance-core = { path = "../concordance-core" }
 concordance-derive = { path = "../concordance-derive" }
 
-# Re-export original dependencies for backward compatibility
+# Core async and networking
 async-nats = "0.42.0"
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+futures-util = "0.3.31"
+
+# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-futures = "0.3"
-tokio = { version = "1.0", features = ["full"] }
-tracing = "0.1.41"
-async-trait = "0.1.88"
-futures-util = "0.3.31"
-tracing-futures = "0.2.5"
-cloudevents-sdk = "0.8.0"
-case = "1.0.0"
-anyhow = "1.0.98"
-chrono = "0.4.41"
-uuid = { version = "1.17.0", features = ["v4", "serde"] }
 serde_bytes = "0.11.17"
 
-# Observability dependencies
+# Error handling and utilities
+anyhow = "1.0.98"
+async-trait = "0.1.88"
+case = "1.0.0"
+chrono = { version = "0.4.41", features = ["serde"] }
+uuid = { version = "1.17.0", features = ["v4", "serde"] }
+
+# Tracing and observability
+tracing = "0.1.41"
+tracing-futures = "0.2.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Optional: OpenTelemetry support
-opentelemetry = { version = "0.21", optional = true }
-opentelemetry-otlp = { version = "0.14", optional = true }
-tracing-opentelemetry = { version = "0.22", optional = true }
+# CloudEvents support
+cloudevents-sdk = "0.8.0"
+
+# OpenTelemetry support (optional but recommended)
+opentelemetry = { version = "0.20", optional = true }
+opentelemetry-otlp = { version = "0.13", optional = true }
+opentelemetry_sdk = { version = "0.20", features = ["rt-tokio"], optional = true }
+tracing-opentelemetry = { version = "0.21", optional = true }
 
 [features]
-default = []
-opentelemetry = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+default = ["opentelemetry"]
+opentelemetry = [
+    "dep:opentelemetry",
+    "dep:opentelemetry-otlp", 
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry"
+]
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -1,0 +1,6 @@
+    Updating crates.io index
+error: no matching package found
+searched package name: `opentelemetry-sdk`
+perhaps you meant:      opentelemetry_sdk
+location searched: crates.io index
+required by package `concordance v0.1.0 (/home/alex-omosa/learn/concordance/concordance)`

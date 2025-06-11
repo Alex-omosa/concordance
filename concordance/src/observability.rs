@@ -1,10 +1,11 @@
-// concordance/src/observability.rs - Observability infrastructure for Concordance
+// concordance/src/observability.rs - OpenTelemetry Observability
 
 use std::sync::Arc;
 use tracing::{info_span, Instrument, Span};
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 use chrono::Utc;
+use anyhow::Result;
 
 // ============ CORRELATION CONTEXT ============
 
@@ -49,7 +50,7 @@ impl CorrelationContext {
 
 // ============ SPAN BUILDER ============
 
-/// Builder for creating consistent tracing spans across layers
+/// Builder for creating consistent tracing spans across layers with OpenTelemetry attributes
 pub struct SpanBuilder;
 
 impl SpanBuilder {
@@ -57,13 +58,21 @@ impl SpanBuilder {
     pub fn nats_ingestion(ctx: &CorrelationContext) -> Span {
         info_span!(
             "nats.message.ingestion",
-            correlation_id = %ctx.correlation_id,
-            nats.message_id = ?ctx.nats_message_id,
-            nats.subject = ?ctx.source_subject,
-            aggregate.type = %ctx.aggregate_type,
-            aggregate.key = %ctx.aggregate_key,
-            operation.type = %ctx.operation_type,
-            layer = "infrastructure"
+            // OpenTelemetry semantic conventions
+            "messaging.system" = "nats",
+            "messaging.operation" = "receive",
+            "messaging.destination" = ?ctx.source_subject,
+            "messaging.message_id" = ?ctx.nats_message_id,
+            
+            // Concordance-specific attributes
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "concordance.aggregate.type" = %ctx.aggregate_type,
+            "concordance.aggregate.key" = %ctx.aggregate_key,
+            "concordance.operation.type" = %ctx.operation_type,
+            
+            // Standard attributes
+            "service.name" = "concordance-worker",
+            "operation.name" = "nats_message_receive",
         )
     }
 
@@ -71,11 +80,13 @@ impl SpanBuilder {
     pub fn worker_processing(ctx: &CorrelationContext) -> Span {
         info_span!(
             "worker.command.processing",
-            correlation_id = %ctx.correlation_id,
-            aggregate.type = %ctx.aggregate_type,
-            aggregate.key = %ctx.aggregate_key,
-            command.type = %ctx.operation_type,
-            layer = "worker"
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "concordance.aggregate.type" = %ctx.aggregate_type,
+            "concordance.aggregate.key" = %ctx.aggregate_key,
+            "concordance.command.type" = %ctx.operation_type,
+            "service.name" = "concordance-worker",
+            "operation.name" = "command_processing",
+            "layer" = "worker"
         )
     }
 
@@ -83,10 +94,14 @@ impl SpanBuilder {
     pub fn state_load(ctx: &CorrelationContext) -> Span {
         info_span!(
             "state.load",
-            correlation_id = %ctx.correlation_id,
-            aggregate.type = %ctx.aggregate_type,
-            aggregate.key = %ctx.aggregate_key,
-            layer = "persistence"
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "concordance.aggregate.type" = %ctx.aggregate_type,
+            "concordance.aggregate.key" = %ctx.aggregate_key,
+            "service.name" = "concordance-worker",
+            "operation.name" = "state_load",
+            "layer" = "persistence",
+            "db.operation" = "select",
+            "db.system" = "nats-kv"
         )
     }
 
@@ -94,11 +109,13 @@ impl SpanBuilder {
     pub fn domain_command_handling(ctx: &CorrelationContext) -> Span {
         info_span!(
             "domain.command.handle",
-            correlation_id = %ctx.correlation_id,
-            aggregate.type = %ctx.aggregate_type,
-            aggregate.key = %ctx.aggregate_key,
-            command.type = %ctx.operation_type,
-            layer = "domain"
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "concordance.aggregate.type" = %ctx.aggregate_type,
+            "concordance.aggregate.key" = %ctx.aggregate_key,
+            "concordance.command.type" = %ctx.operation_type,
+            "service.name" = "concordance-worker",
+            "operation.name" = "domain_command_handle",
+            "layer" = "domain"
         )
     }
 
@@ -106,11 +123,13 @@ impl SpanBuilder {
     pub fn domain_event_apply(ctx: &CorrelationContext, event_type: &str) -> Span {
         info_span!(
             "domain.event.apply",
-            correlation_id = %ctx.correlation_id,
-            aggregate.type = %ctx.aggregate_type,
-            aggregate.key = %ctx.aggregate_key,
-            event.type = %event_type,
-            layer = "domain"
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "concordance.aggregate.type" = %ctx.aggregate_type,
+            "concordance.aggregate.key" = %ctx.aggregate_key,
+            "concordance.event.type" = %event_type,
+            "service.name" = "concordance-worker",
+            "operation.name" = "domain_event_apply",
+            "layer" = "domain"
         )
     }
 
@@ -118,10 +137,14 @@ impl SpanBuilder {
     pub fn state_persist(ctx: &CorrelationContext) -> Span {
         info_span!(
             "state.persist",
-            correlation_id = %ctx.correlation_id,
-            aggregate.type = %ctx.aggregate_type,
-            aggregate.key = %ctx.aggregate_key,
-            layer = "persistence"
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "concordance.aggregate.type" = %ctx.aggregate_type,
+            "concordance.aggregate.key" = %ctx.aggregate_key,
+            "service.name" = "concordance-worker",
+            "operation.name" = "state_persist",
+            "layer" = "persistence",
+            "db.operation" = "update",
+            "db.system" = "nats-kv"
         )
     }
 
@@ -129,11 +152,18 @@ impl SpanBuilder {
     pub fn event_publish(ctx: &CorrelationContext, event_type: &str) -> Span {
         info_span!(
             "event.publish",
-            correlation_id = %ctx.correlation_id,
-            aggregate.type = %ctx.aggregate_type,
-            aggregate.key = %ctx.aggregate_key,
-            event.type = %event_type,
-            layer = "infrastructure"
+            "messaging.system" = "nats",
+            "messaging.operation" = "publish",
+            "messaging.destination" = format!("cc.events.{}", event_type),
+            
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "concordance.aggregate.type" = %ctx.aggregate_type,
+            "concordance.aggregate.key" = %ctx.aggregate_key,
+            "concordance.event.type" = %event_type,
+            
+            "service.name" = "concordance-worker",
+            "operation.name" = "event_publish",
+            "layer" = "infrastructure"
         )
     }
 
@@ -141,26 +171,33 @@ impl SpanBuilder {
     pub fn message_ack(ctx: &CorrelationContext, success: bool) -> Span {
         info_span!(
             "nats.message.ack",
-            correlation_id = %ctx.correlation_id,
-            ack.success = %success,
-            layer = "infrastructure"
+            "messaging.system" = "nats",
+            "messaging.operation" = if success { "ack" } else { "nack" },
+            
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "concordance.ack.success" = %success,
+            
+            "service.name" = "concordance-worker",
+            "operation.name" = "message_ack",
+            "layer" = "infrastructure"
         )
     }
 }
 
 // ============ OPERATION LOGGER ============
 
-/// Structured logger for operation flow
+/// Structured logger for operation flow with OpenTelemetry attributes
 pub struct OperationLogger;
 
 impl OperationLogger {
     /// Log the start of an operation
     pub fn operation_started(ctx: &CorrelationContext) {
         tracing::info!(
-            correlation_id = %ctx.correlation_id,
-            aggregate.type = %ctx.aggregate_type,
-            aggregate.key = %ctx.aggregate_key,
-            operation.type = %ctx.operation_type,
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "concordance.aggregate.type" = %ctx.aggregate_type,
+            "concordance.aggregate.key" = %ctx.aggregate_key,
+            "concordance.operation.type" = %ctx.operation_type,
+            "operation.started" = true,
             "Operation started"
         );
     }
@@ -168,12 +205,13 @@ impl OperationLogger {
     /// Log successful operation completion
     pub fn operation_completed(ctx: &CorrelationContext, duration_ms: u64, events_generated: usize) {
         tracing::info!(
-            correlation_id = %ctx.correlation_id,
-            aggregate.type = %ctx.aggregate_type,
-            aggregate.key = %ctx.aggregate_key,
-            operation.type = %ctx.operation_type,
-            duration_ms = %duration_ms,
-            events.generated = %events_generated,
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "concordance.aggregate.type" = %ctx.aggregate_type,
+            "concordance.aggregate.key" = %ctx.aggregate_key,
+            "concordance.operation.type" = %ctx.operation_type,
+            "concordance.operation.duration_ms" = %duration_ms,
+            "concordance.events.generated" = %events_generated,
+            "operation.completed" = true,
             "Operation completed successfully"
         );
     }
@@ -181,12 +219,13 @@ impl OperationLogger {
     /// Log operation failure
     pub fn operation_failed(ctx: &CorrelationContext, error: &str, duration_ms: u64) {
         tracing::error!(
-            correlation_id = %ctx.correlation_id,
-            aggregate.type = %ctx.aggregate_type,
-            aggregate.key = %ctx.aggregate_key,
-            operation.type = %ctx.operation_type,
-            error = %error,
-            duration_ms = %duration_ms,
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "concordance.aggregate.type" = %ctx.aggregate_type,
+            "concordance.aggregate.key" = %ctx.aggregate_key,
+            "concordance.operation.type" = %ctx.operation_type,
+            "concordance.operation.duration_ms" = %duration_ms,
+            "concordance.error.message" = %error,
+            "operation.failed" = true,
             "Operation failed"
         );
     }
@@ -194,11 +233,12 @@ impl OperationLogger {
     /// Log state transition
     pub fn state_transition(ctx: &CorrelationContext, from_version: u32, to_version: u32) {
         tracing::info!(
-            correlation_id = %ctx.correlation_id,
-            aggregate.type = %ctx.aggregate_type,
-            aggregate.key = %ctx.aggregate_key,
-            state.version.from = %from_version,
-            state.version.to = %to_version,
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "concordance.aggregate.type" = %ctx.aggregate_type,
+            "concordance.aggregate.key" = %ctx.aggregate_key,
+            "concordance.state.version.from" = %from_version,
+            "concordance.state.version.to" = %to_version,
+            "state.transition" = true,
             "State transition"
         );
     }
@@ -206,11 +246,12 @@ impl OperationLogger {
     /// Log event generation
     pub fn event_generated(ctx: &CorrelationContext, event_type: &str, event_size: usize) {
         tracing::debug!(
-            correlation_id = %ctx.correlation_id,
-            aggregate.type = %ctx.aggregate_type,
-            aggregate.key = %ctx.aggregate_key,
-            event.type = %event_type,
-            event.size_bytes = %event_size,
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "concordance.aggregate.type" = %ctx.aggregate_type,
+            "concordance.aggregate.key" = %ctx.aggregate_key,
+            "concordance.event.type" = %event_type,
+            "concordance.event.size_bytes" = %event_size,
+            "event.generated" = true,
             "Event generated"
         );
     }
@@ -218,30 +259,13 @@ impl OperationLogger {
     /// Log NATS interaction
     pub fn nats_interaction(ctx: &CorrelationContext, operation: &str, subject: &str) {
         tracing::debug!(
-            correlation_id = %ctx.correlation_id,
-            nats.operation = %operation,
-            nats.subject = %subject,
+            "concordance.correlation_id" = %ctx.correlation_id,
+            "messaging.system" = "nats",
+            "messaging.operation" = %operation,
+            "messaging.destination" = %subject,
+            "nats.interaction" = true,
             "NATS interaction"
         );
-    }
-}
-
-// ============ INSTRUMENTATION HELPERS ============
-
-/// Extension trait to add correlation context to futures
-pub trait InstrumentWithContext: Sized {
-    type Output;
-    fn instrument_with_context(self, ctx: Arc<CorrelationContext>) -> Self::Output;
-}
-
-impl<T: std::future::Future> InstrumentWithContext for T {
-    type Output = tracing::instrument::Instrumented<T>;
-    
-    fn instrument_with_context(self, ctx: Arc<CorrelationContext>) -> Self::Output {
-        self.instrument(tracing::info_span!(
-            "operation",
-            correlation_id = %ctx.correlation_id
-        ))
     }
 }
 
@@ -302,17 +326,18 @@ impl OperationMetrics {
         self.total_event_size_bytes += size_bytes;
     }
 
-    /// Log timing metrics
+    /// Log timing metrics with OpenTelemetry-friendly attributes
     pub fn log_timings(&self, ctx: &CorrelationContext) {
         if let (Some(start), Some(end)) = (self.command_received_at, self.acknowledged_at) {
             let total_duration = (end - start).num_milliseconds();
             
             tracing::info!(
-                correlation_id = %ctx.correlation_id,
-                metrics.total_duration_ms = %total_duration,
-                metrics.state_size_bytes = ?self.state_size_bytes,
-                metrics.events_generated = %self.events_generated,
-                metrics.total_event_size_bytes = %self.total_event_size_bytes,
+                "concordance.correlation_id" = %ctx.correlation_id,
+                "concordance.metrics.total_duration_ms" = %total_duration,
+                "concordance.metrics.state_size_bytes" = ?self.state_size_bytes,
+                "concordance.metrics.events_generated" = %self.events_generated,
+                "concordance.metrics.total_event_size_bytes" = %self.total_event_size_bytes,
+                "operation.metrics" = true,
                 "Operation metrics"
             );
 
@@ -320,9 +345,10 @@ impl OperationMetrics {
             if let Some(state_loaded) = self.state_loaded_at {
                 let state_load_duration = (state_loaded - start).num_milliseconds();
                 tracing::debug!(
-                    correlation_id = %ctx.correlation_id,
-                    metrics.phase = "state_load",
-                    metrics.duration_ms = %state_load_duration,
+                    "concordance.correlation_id" = %ctx.correlation_id,
+                    "concordance.metrics.phase" = "state_load",
+                    "concordance.metrics.duration_ms" = %state_load_duration,
+                    "phase.timing" = true,
                     "Phase timing"
                 );
             }
@@ -330,9 +356,10 @@ impl OperationMetrics {
             if let (Some(handled), Some(loaded)) = (self.command_handled_at, self.state_loaded_at) {
                 let command_handle_duration = (handled - loaded).num_milliseconds();
                 tracing::debug!(
-                    correlation_id = %ctx.correlation_id,
-                    metrics.phase = "command_handle",
-                    metrics.duration_ms = %command_handle_duration,
+                    "concordance.correlation_id" = %ctx.correlation_id,
+                    "concordance.metrics.phase" = "command_handle",
+                    "concordance.metrics.duration_ms" = %command_handle_duration,
+                    "phase.timing" = true,
                     "Phase timing"
                 );
             }
@@ -340,70 +367,106 @@ impl OperationMetrics {
     }
 }
 
-// ============ TRACING SETUP ============
+// ============ OPENTELEMETRY INITIALIZATION ============
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-/// Initialize tracing with structured output
-pub fn init_tracing() {
+/// Initialize tracing with OpenTelemetry support
+pub fn init_tracing() -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| {
-            // Default filter - adjust as needed
-            EnvFilter::new(
-                "concordance=debug,user_app=debug,warn"
-            )
+            EnvFilter::new("concordance=debug,user_app=debug,info")
         });
 
+    #[cfg(feature = "opentelemetry")]
+    {
+        init_tracing_with_otel(filter)
+    }
+
+    #[cfg(not(feature = "opentelemetry"))]
+    {
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_thread_ids(true)
+            .with_thread_names(true)
+            .with_target(true)
+            .with_level(true)
+            .json();
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .init();
+        
+        tracing::info!("Tracing initialized (without OpenTelemetry)");
+        Ok(())
+    }
+}
+
+/// Initialize tracing with OpenTelemetry and Jaeger
+#[cfg(feature = "opentelemetry")]
+pub fn init_tracing_with_otel(filter: EnvFilter) -> Result<()> {
+    use opentelemetry_sdk::trace::TracerProvider;
+    use opentelemetry_otlp::WithExportConfig;
+    use tracing_subscriber::layer::SubscriberExt;
+    use opentelemetry_sdk::Resource;
+    use opentelemetry::KeyValue;
+    
+    let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:4317".to_string());
+    
+    tracing::info!("Initializing OpenTelemetry with endpoint: {}", otlp_endpoint);
+    
+    // Create resource with service information
+    let resource = Resource::new(vec![
+        KeyValue::new("service.name", "concordance"),
+        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        KeyValue::new("service.namespace", "event-sourcing"),
+    ]);
+    
+    // Configure OTLP exporter for Jaeger
+    let tracer = opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_exporter(
+            opentelemetry_otlp::new_exporter()
+                .tonic()
+                .with_endpoint(otlp_endpoint)
+        )
+        .with_trace_config(
+            opentelemetry_sdk::trace::config()
+                .with_resource(resource)
+        )
+        .install_batch(opentelemetry_sdk::runtime::Tokio)
+        .map_err(|e| anyhow::anyhow!("Failed to initialize OTLP trace pipeline: {}", e))?;
+    
+    // Create layers
+    let telemetry_layer = tracing_opentelemetry::layer()
+        .with_tracer(tracer);
+    
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_thread_ids(true)
         .with_thread_names(true)
         .with_target(true)
         .with_level(true)
-        .json(); // JSON output for structured logging
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt_layer)
-        .init();
-}
-
-// ============ OPENTELEMETRY SETUP (for future use with Tempo) ============
-
-#[cfg(feature = "opentelemetry")]
-pub fn init_tracing_with_otel() {
-    use opentelemetry::sdk::trace::TracerProvider;
-    use opentelemetry_otlp::WithExportConfig;
-    use tracing_subscriber::layer::SubscriberExt;
-    
-    // Configure OTLP exporter for Tempo
-    let otlp_exporter = opentelemetry_otlp::new_exporter()
-        .tonic()
-        .with_endpoint("http://localhost:4317");
-    
-    let trace_provider = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(otlp_exporter)
-        .with_trace_config(
-            opentelemetry::sdk::trace::config()
-                .with_resource(opentelemetry::sdk::Resource::new(vec![
-                    opentelemetry::KeyValue::new("service.name", "concordance"),
-                ]))
-        )
-        .install_batch(opentelemetry::runtime::Tokio)
-        .expect("Failed to initialize OTLP trace pipeline");
-    
-    let telemetry_layer = tracing_opentelemetry::layer()
-        .with_tracer(trace_provider.tracer("concordance"));
-    
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("concordance=debug,user_app=debug,warn"));
-    
-    let fmt_layer = tracing_subscriber::fmt::layer()
         .json();
     
+    // Compose all layers
     tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)
         .with(telemetry_layer)
         .init();
+    
+    tracing::info!("OpenTelemetry tracing initialized successfully");
+    Ok(())
+}
+
+/// Shutdown OpenTelemetry gracefully
+#[cfg(feature = "opentelemetry")]
+pub fn shutdown_telemetry() {
+    opentelemetry::global::shutdown_tracer_provider();
+}
+
+#[cfg(not(feature = "opentelemetry"))]
+pub fn shutdown_telemetry() {
+    // No-op when OpenTelemetry is not enabled
 }
