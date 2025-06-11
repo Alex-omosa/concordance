@@ -481,7 +481,9 @@ pub async fn run_aggregate_worker(
     Ok(())
 }
 
-/// Internal worker loop with enhanced error handling and connection recovery
+// Replace the message processing loop in concordance/src/lib.rs around line 850
+
+/// Enhanced worker loop with improved heartbeat handling
 async fn run_worker_loop(
     nc: &async_nats::Client,
     js: &async_nats::jetstream::Context,
@@ -501,11 +503,11 @@ async fn run_worker_loop(
                 name: Some(consumer_name.to_string()),
                 description: Some(format!("Commands for {}", aggregate_name)),
                 ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
-                ack_wait: std::time::Duration::from_secs(60), // Increased from 30s
+                ack_wait: std::time::Duration::from_secs(90), // 🔧 INCREASED: More time for processing
                 max_deliver: 3,
                 deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::All,
                 filter_subject: filter_subject.to_string(),
-                max_waiting: 5, // Limit concurrent pulls
+                max_waiting: 1, // 🔧 REDUCED: Only 1 concurrent pull to avoid heartbeat issues
                 ..Default::default()
             },
         )
@@ -514,7 +516,7 @@ async fn run_worker_loop(
 
     let mut messages = consumer
         .stream()
-        .max_messages_per_batch(5) // Reduced batch size for better responsiveness
+        .max_messages_per_batch(1) // Process one message at a time
         .messages()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create message stream: {}", e))?;
@@ -525,38 +527,36 @@ async fn run_worker_loop(
         "Worker ready to process commands"
     );
 
-    // Enhanced message processing with timeout and heartbeat handling
-    let mut consecutive_heartbeat_errors = 0;
-    const MAX_CONSECUTIVE_HEARTBEAT_ERRORS: u32 = 3;
+    // 🔧 IMPROVED: Better heartbeat error tracking
+    let mut last_heartbeat_error = std::time::Instant::now();
+    let mut consecutive_errors = 0;
     
     loop {
-        // Use timeout to prevent hanging on next()
+        // 🔧 REDUCED: Shorter timeout to handle heartbeats better
         let message_result = tokio::time::timeout(
-            std::time::Duration::from_secs(30), // 30s timeout for getting next message
+            std::time::Duration::from_secs(15), // Reduced from 30s to 15s
             messages.next()
         ).await;
 
         match message_result {
             Ok(Some(msg_result)) => {
-                consecutive_heartbeat_errors = 0; // Reset error counter on successful message
+                consecutive_errors = 0; // Reset on successful message reception
                 
                 match msg_result {
                     Ok(message) => {
-                        // Extract NATS metadata
+                        // Process message normally
                         let nats_message_id = match message.info() {
                             Ok(info) => Some(format!("{}", info.stream_sequence)),
                             Err(_) => None,
                         };
                         let nats_subject = message.subject.clone();
                         
-                        // Parse command
                         let raw_command: RawCommand = match serde_json::from_slice(&message.payload) {
                             Ok(cmd) => cmd,
                             Err(e) => {
                                 tracing::error!(
                                     error = %e,
                                     nats.subject = %message.subject,
-                                    nats.payload = ?String::from_utf8_lossy(&message.payload),
                                     "Failed to parse command"
                                 );
                                 let _ = message.ack().await;
@@ -564,7 +564,6 @@ async fn run_worker_loop(
                             }
                         };
 
-                        // Create correlation context
                         let correlation_ctx = CorrelationContext::new(
                             aggregate_name.to_string(),
                             raw_command.key.clone(),
@@ -572,7 +571,6 @@ async fn run_worker_loop(
                         )
                         .with_nats_info(nats_message_id, Some(nats_subject.to_string()));
 
-                        // Process command with full observability
                         let operation_start = std::time::Instant::now();
                         
                         match process_command_with_observability(
@@ -616,42 +614,49 @@ async fn run_worker_loop(
                         }
                     }
                     Err(e) => {
-                        // Handle specific NATS errors
                         let error_msg = e.to_string();
+                        
+                        // 🔧 IMPROVED: Better heartbeat error handling
                         if error_msg.contains("missed idle heartbeat") {
-                            consecutive_heartbeat_errors += 1;
-                            tracing::warn!(
-                                worker.aggregate_name = %aggregate_name,
-                                error = %e,
-                                consecutive_errors = %consecutive_heartbeat_errors,
-                                "NATS heartbeat timeout detected"
-                            );
+                            let now = std::time::Instant::now();
+                            let time_since_last = now.duration_since(last_heartbeat_error);
                             
-                            if consecutive_heartbeat_errors >= MAX_CONSECUTIVE_HEARTBEAT_ERRORS {
+                            // Only log if it's been a while since the last error
+                            if time_since_last > std::time::Duration::from_secs(60) {
+                                tracing::debug!( // 🔧 CHANGED: From error to debug
+                                    worker.aggregate_name = %aggregate_name,
+                                    "Heartbeat timeout during idle period (this is normal)"
+                                );
+                                last_heartbeat_error = now;
+                            }
+                            
+                            consecutive_errors += 1;
+                            
+                            // 🔧 ONLY restart after many consecutive errors over a long period
+                            if consecutive_errors > 50 && time_since_last < std::time::Duration::from_secs(10) {
                                 tracing::error!(
                                     worker.aggregate_name = %aggregate_name,
-                                    consecutive_errors = %consecutive_heartbeat_errors,
-                                    "Too many consecutive heartbeat errors, restarting worker"
+                                    consecutive_errors = %consecutive_errors,
+                                    "Too many rapid heartbeat errors, restarting worker"
                                 );
-                                return Err(anyhow::anyhow!("Too many consecutive heartbeat timeouts"));
+                                return Err(anyhow::anyhow!("Excessive heartbeat timeouts"));
                             }
                             
                             // Short delay before continuing
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         } else {
-                            tracing::error!(
+                            // For non-heartbeat errors, log normally
+                            tracing::warn!(
                                 worker.aggregate_name = %aggregate_name,
                                 error = %e,
-                                "Error receiving message from NATS"
+                                "NATS message error"
                             );
-                            // For other errors, also add a small delay
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
                     }
                 }
             }
             Ok(None) => {
-                // Stream ended normally
                 tracing::info!(
                     worker.aggregate_name = %aggregate_name,
                     "Message stream ended"
@@ -659,13 +664,13 @@ async fn run_worker_loop(
                 return Ok(());
             }
             Err(_timeout) => {
-                // Timeout waiting for messages - this is normal for idle periods
-                tracing::debug!(
+                // 🔧 IMPROVED: Timeout is normal during idle periods
+                tracing::trace!( // 🔧 CHANGED: From debug to trace
                     worker.aggregate_name = %aggregate_name,
-                    "Message timeout (no messages in 30s) - continuing"
+                    "No messages in 15s (normal during idle periods)"
                 );
                 
-                // Check if NATS connection is still healthy
+                // Check NATS connection health less frequently
                 if nc.connection_state() != async_nats::connection::State::Connected {
                     tracing::error!(
                         worker.aggregate_name = %aggregate_name,
@@ -675,13 +680,11 @@ async fn run_worker_loop(
                     return Err(anyhow::anyhow!("NATS connection lost"));
                 }
                 
-                // Continue the loop - timeout is expected during idle periods
                 continue;
             }
         }
     }
 }
-
 /// Enhanced command processing with full observability
 async fn process_command_with_observability(
     state: &EntityState,

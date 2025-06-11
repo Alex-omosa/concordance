@@ -1,55 +1,46 @@
-# Vector configuration for Concordance logs
+# Minimal Vector configuration that actually works
 
-# Input: Read Concordance JSON logs from file
+# Input: Read logs from file
 [sources.concordance_logs]
 type = "file"
-include = ["/logs/concordance*.log"]
-read_from = "beginning" 
-file_key = "file"
-max_read_bytes = 10240
-ignore_older_secs = 86400  # 🔧 Process files up to 24 hours old
-multiline.start_pattern = "^{\"timestamp\""  # 🔧 JSON log line detection
+include = ["/logs/*.log"]
+read_from = "beginning"
 
-# Transform: Parse JSON logs
+# Transform: Minimal processing to avoid VRL errors
 [transforms.parse_concordance]
 type = "remap"
 inputs = ["concordance_logs"]
 source = '''
-parsed = parse_json!(.message)
-. = parsed
+# Set basic required fields
+.job = "concordance"
+.level = "INFO" 
+.target = "unknown"
 
-# Add timestamp if not present
-if !exists(.timestamp) {
-  .timestamp = now()
+# Try to parse JSON, but don't fail if it's not valid JSON
+if is_string(.message) {
+    parsed, err = parse_json(.message)
+    if err == null {
+        if exists(parsed.level) {
+            .level = to_string(parsed.level)
+        }
+        if exists(parsed.target) {
+            .target = to_string(parsed.target) 
+        }
+        if exists(parsed.correlation_id) {
+            .correlation_id = to_string(parsed.correlation_id)
+        }
+        if exists(parsed."aggregate.type") {
+            .aggregate_type = to_string(parsed."aggregate.type")
+        }
+    }
 }
 
-# Ensure required fields exist with defaults
-.level = string(.level) ?? "INFO"
-.target = string(.target) ?? "unknown"
-.layer = string(.layer) ?? "unknown"
-
-# Extract aggregate info safely
-if exists(."aggregate.type") {
-  .aggregate_type = string(."aggregate.type") ?? "unknown"
-} else {
-  .aggregate_type = "unknown"
+# Set defaults for missing fields
+if !exists(.correlation_id) {
+    .correlation_id = ""
 }
-
-if exists(."aggregate.key") {
-  .aggregate_key = string(."aggregate.key") ?? ""
-}
-
-if exists(.correlation_id) {
-  .correlation_id = string(.correlation_id) ?? ""
-}
-
-# Extract metrics
-if exists(.duration_ms) {
-  .duration_ms = to_float(.duration_ms) ?? 0.0
-}
-
-if exists(."events.generated") {
-  .events_generated = to_int(."events.generated") ?? 0
+if !exists(.aggregate_type) {
+    .aggregate_type = "unknown"
 }
 '''
 
@@ -61,17 +52,7 @@ endpoint = "http://loki:3100"
 encoding.codec = "json"
 healthcheck.enabled = true
 
-# Labels for Loki
+# Simple labels
 [sinks.loki.labels]
 job = "concordance"
 level = "{{ level }}"
-target = "{{ target }}"
-layer = "{{ layer }}"
-aggregate_type = "{{ aggregate_type }}"
-
-# Optional: Console output for debugging
-[sinks.console]
-type = "console"
-inputs = ["parse_concordance"]
-encoding.codec = "json"
-target = "stdout"
