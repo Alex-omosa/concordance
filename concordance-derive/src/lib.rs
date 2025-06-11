@@ -1,17 +1,10 @@
+// concordance-derive/src/lib.rs - Enhanced for Phase 2
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, DeriveInput, Data, Fields, Attribute, Meta, Expr, Lit};
 
-/// Derive macro for automatic aggregate registration
-/// 
-/// Usage:
-/// ```rust
-/// #[derive(Aggregate)]
-/// #[aggregate(name = "order")]
-/// pub struct OrderAggregate {
-///     // ... fields
-/// }
-/// ```
+/// Enhanced derive macro that generates real dispatch handlers
 #[proc_macro_derive(Aggregate, attributes(aggregate))]
 pub fn derive_aggregate(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -45,11 +38,14 @@ fn expand_aggregate(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream
     // Extract aggregate name from attributes
     let aggregate_name = extract_aggregate_name(&input.attrs)?;
     
-    // Generate the registration code using the correct function name
+    // Get the type name for the registration
+    let type_name = &input.ident;
+    
+    // 🎉 PHASE 2: Generate registration with actual dispatch handler!
     let expanded = quote! {
-        // Automatically register this aggregate type using inventory
+        // Automatically register this aggregate type with REAL dispatch
         ::concordance::concordance_core::inventory::submit! {
-            ::concordance::concordance_core::create_aggregate_descriptor(#aggregate_name)
+            ::concordance::concordance_core::create_aggregate_descriptor::<#type_name>()
         }
     };
 

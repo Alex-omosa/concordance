@@ -1,14 +1,44 @@
+# examples/user-app/Cargo.toml - Phase 3 Dependencies
+
 [package]
 name = "user-app"
 version = "0.1.0"
 edition = "2021"
 
+# Multiple binaries
+[[bin]]
+name = "user-app"
+path = "src/main.rs"
+
+[[bin]]
+name = "worker"
+path = "src/bin/worker.rs"
+
 [dependencies]
+# Core Concordance framework
 concordance = { path = "../../concordance" }
+
+# Async runtime and utilities
 tokio = { version = "1.0", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = "0.3"
+futures = "0.3"
+
+# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUID generation for events
+uuid = { version = "1.0", features = ["v4"] }
+
+# Time handling for events
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
 anyhow = "1.0"
+async-nats = "0.41.0"
+
+# Optional: NATS client for direct testing (already included via concordance)
+# async-nats = "0.41.0"
