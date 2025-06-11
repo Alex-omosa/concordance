@@ -15,6 +15,7 @@ tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
 anyhow = "1.0"
 async-trait = "0.1"
+async-nats = "0.42.0"
 
 # This helps with build times and ensures consistent versions
 [profile.dev]

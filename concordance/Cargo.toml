@@ -13,7 +13,7 @@ concordance-core = { path = "../concordance-core" }
 concordance-derive = { path = "../concordance-derive" }
 
 # Re-export original dependencies for backward compatibility
-async-nats = "0.41.0"
+async-nats = "0.42.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 futures = "0.3"

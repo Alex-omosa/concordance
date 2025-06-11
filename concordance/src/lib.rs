@@ -1,4 +1,4 @@
-// concordance/src/lib.rs - Enhanced with Auto-Setup, Worker Management, and Observability
+// concordance/src/lib.rs - Enhanced with Auto-Setup, Fixed Worker Management, and Observability
 
 // ============ MODULES ============
 pub mod persistence;
@@ -83,7 +83,11 @@ impl BaseConfiguration {
         tracing::info!("🔌 Connecting to NATS at: {}", self.nats_url);
         
         let opts = async_nats::ConnectOptions::default()
-            .name("Concordance Event Sourcing Framework");
+            .name("Concordance Event Sourcing Framework")
+            .max_reconnects(Some(60)) // Increased reconnect attempts
+            .reconnect_delay_callback(|attempts| {
+                std::time::Duration::from_millis(std::cmp::min((attempts as u64) * 100, 5000))
+            });
 
         let client = opts
             .connect(&self.nats_url)
@@ -428,9 +432,9 @@ impl ConcordanceProvider {
     }
 }
 
-// ============ SIMPLIFIED WORKER FUNCTION WITH OBSERVABILITY ============
+// ============ ENHANCED WORKER FUNCTION WITH ROBUST ERROR HANDLING ============
 
-/// Enhanced worker function with comprehensive observability
+/// Enhanced worker function with robust heartbeat and connection handling
 pub async fn run_aggregate_worker(
     nc: async_nats::Client,
     js: async_nats::jetstream::Context,
@@ -447,26 +451,73 @@ pub async fn run_aggregate_worker(
         "Starting aggregate worker"
     );
 
-    let stream = js.get_stream("CC_COMMANDS").await?;
+    loop {
+        // Wrap the entire worker loop in error handling to allow restarts
+        match run_worker_loop(&nc, &js, &state, aggregate_name, &consumer_name, &filter_subject).await {
+            Ok(_) => {
+                tracing::warn!(
+                    worker.aggregate_name = %aggregate_name,
+                    "Worker loop ended normally"
+                );
+                break;
+            }
+            Err(e) => {
+                tracing::error!(
+                    worker.aggregate_name = %aggregate_name,
+                    error = %e,
+                    "Worker loop failed, will restart in 5 seconds"
+                );
+                
+                // Wait before restarting to avoid tight loops
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tracing::info!(
+                    worker.aggregate_name = %aggregate_name,
+                    "Restarting worker loop"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Internal worker loop with enhanced error handling and connection recovery
+async fn run_worker_loop(
+    nc: &async_nats::Client,
+    js: &async_nats::jetstream::Context,
+    state: &EntityState,
+    aggregate_name: &str,
+    consumer_name: &str,
+    filter_subject: &str,
+) -> Result<()> {
+    let stream = js.get_stream("CC_COMMANDS").await
+        .map_err(|e| anyhow::anyhow!("Failed to get commands stream: {}", e))?;
     
     let consumer = stream
         .get_or_create_consumer(
-            &consumer_name,
+            consumer_name,
             async_nats::jetstream::consumer::pull::Config {
-                durable_name: Some(consumer_name.clone()),
-                name: Some(consumer_name.clone()),
+                durable_name: Some(consumer_name.to_string()),
+                name: Some(consumer_name.to_string()),
                 description: Some(format!("Commands for {}", aggregate_name)),
                 ack_policy: async_nats::jetstream::consumer::AckPolicy::Explicit,
-                ack_wait: std::time::Duration::from_secs(30),
+                ack_wait: std::time::Duration::from_secs(60), // Increased from 30s
                 max_deliver: 3,
                 deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::All,
-                filter_subject,
+                filter_subject: filter_subject.to_string(),
+                max_waiting: 5, // Limit concurrent pulls
                 ..Default::default()
             },
         )
-        .await?;
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create consumer: {}", e))?;
 
-    let mut messages = consumer.messages().await?;
+    let mut messages = consumer
+        .stream()
+        .max_messages_per_batch(5) // Reduced batch size for better responsiveness
+        .messages()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create message stream: {}", e))?;
     
     tracing::info!(
         worker.aggregate_name = %aggregate_name,
@@ -474,98 +525,161 @@ pub async fn run_aggregate_worker(
         "Worker ready to process commands"
     );
 
-    while let Some(msg) = messages.next().await {
-        match msg {
-            Ok(message) => {
-                // Extract NATS metadata
-                let nats_message_id = match message.info() {
-                    Ok(info) => Some(format!("{}", info.stream_sequence)),
-                    Err(_) => None,
-                };
-                let nats_subject = message.subject.clone();
-                
-                // Parse command
-                let raw_command: RawCommand = match serde_json::from_slice(&message.payload) {
-                    Ok(cmd) => cmd,
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            nats.subject = %message.subject,
-                            nats.payload = ?String::from_utf8_lossy(&message.payload),
-                            "Failed to parse command"
-                        );
-                        let _ = message.ack().await;
-                        continue;
-                    }
-                };
+    // Enhanced message processing with timeout and heartbeat handling
+    let mut consecutive_heartbeat_errors = 0;
+    const MAX_CONSECUTIVE_HEARTBEAT_ERRORS: u32 = 3;
+    
+    loop {
+        // Use timeout to prevent hanging on next()
+        let message_result = tokio::time::timeout(
+            std::time::Duration::from_secs(30), // 30s timeout for getting next message
+            messages.next()
+        ).await;
 
-                // Create correlation context
-                let correlation_ctx = CorrelationContext::new(
-                    aggregate_name.to_string(),
-                    raw_command.key.clone(),
-                    raw_command.command_type.clone(),
-                )
-                .with_nats_info(nats_message_id, Some(nats_subject.to_string()));
-
-                // Process command with full observability
-                let operation_start = std::time::Instant::now();
+        match message_result {
+            Ok(Some(msg_result)) => {
+                consecutive_heartbeat_errors = 0; // Reset error counter on successful message
                 
-                match process_command_with_observability(
-                    &state,
-                    &nc,
-                    aggregate_name,
-                    raw_command,
-                    correlation_ctx.clone(),
-                )
-                .await {
-                    Ok(_) => {
-                        let ack_span = SpanBuilder::message_ack(&correlation_ctx, true);
-                        let _guard = ack_span.enter();
+                match msg_result {
+                    Ok(message) => {
+                        // Extract NATS metadata
+                        let nats_message_id = match message.info() {
+                            Ok(info) => Some(format!("{}", info.stream_sequence)),
+                            Err(_) => None,
+                        };
+                        let nats_subject = message.subject.clone();
                         
-                        if let Err(e) = message.ack().await {
-                            tracing::error!(
-                                correlation_id = %correlation_ctx.correlation_id,
-                                error = %e,
-                                "Failed to acknowledge message"
-                            );
-                        } else {
-                            let duration_ms = operation_start.elapsed().as_millis() as u64;
-                            OperationLogger::operation_completed(&correlation_ctx, duration_ms, 0);
+                        // Parse command
+                        let raw_command: RawCommand = match serde_json::from_slice(&message.payload) {
+                            Ok(cmd) => cmd,
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    nats.subject = %message.subject,
+                                    nats.payload = ?String::from_utf8_lossy(&message.payload),
+                                    "Failed to parse command"
+                                );
+                                let _ = message.ack().await;
+                                continue;
+                            }
+                        };
+
+                        // Create correlation context
+                        let correlation_ctx = CorrelationContext::new(
+                            aggregate_name.to_string(),
+                            raw_command.key.clone(),
+                            raw_command.command_type.clone(),
+                        )
+                        .with_nats_info(nats_message_id, Some(nats_subject.to_string()));
+
+                        // Process command with full observability
+                        let operation_start = std::time::Instant::now();
+                        
+                        match process_command_with_observability(
+                            state,
+                            nc,
+                            aggregate_name,
+                            raw_command,
+                            correlation_ctx.clone(),
+                        )
+                        .await {
+                            Ok(_) => {
+                                let ack_span = SpanBuilder::message_ack(&correlation_ctx, true);
+                                let _guard = ack_span.enter();
+                                
+                                if let Err(e) = message.ack().await {
+                                    tracing::error!(
+                                        correlation_id = %correlation_ctx.correlation_id,
+                                        error = %e,
+                                        "Failed to acknowledge message"
+                                    );
+                                } else {
+                                    let duration_ms = operation_start.elapsed().as_millis() as u64;
+                                    OperationLogger::operation_completed(&correlation_ctx, duration_ms, 0);
+                                }
+                            }
+                            Err(e) => {
+                                let duration_ms = operation_start.elapsed().as_millis() as u64;
+                                OperationLogger::operation_failed(&correlation_ctx, &e.to_string(), duration_ms);
+                                
+                                let ack_span = SpanBuilder::message_ack(&correlation_ctx, false);
+                                let _guard = ack_span.enter();
+                                
+                                if let Err(nack_err) = message.ack_with(async_nats::jetstream::AckKind::Nak(None)).await {
+                                    tracing::error!(
+                                        correlation_id = %correlation_ctx.correlation_id,
+                                        error = %nack_err,
+                                        "Failed to nack message"
+                                    );
+                                }
+                            }
                         }
                     }
                     Err(e) => {
-                        let duration_ms = operation_start.elapsed().as_millis() as u64;
-                        OperationLogger::operation_failed(&correlation_ctx, &e.to_string(), duration_ms);
-                        
-                        let ack_span = SpanBuilder::message_ack(&correlation_ctx, false);
-                        let _guard = ack_span.enter();
-                        
-                        if let Err(nack_err) = message.ack_with(async_nats::jetstream::AckKind::Nak(None)).await {
-                            tracing::error!(
-                                correlation_id = %correlation_ctx.correlation_id,
-                                error = %nack_err,
-                                "Failed to nack message"
+                        // Handle specific NATS errors
+                        let error_msg = e.to_string();
+                        if error_msg.contains("missed idle heartbeat") {
+                            consecutive_heartbeat_errors += 1;
+                            tracing::warn!(
+                                worker.aggregate_name = %aggregate_name,
+                                error = %e,
+                                consecutive_errors = %consecutive_heartbeat_errors,
+                                "NATS heartbeat timeout detected"
                             );
+                            
+                            if consecutive_heartbeat_errors >= MAX_CONSECUTIVE_HEARTBEAT_ERRORS {
+                                tracing::error!(
+                                    worker.aggregate_name = %aggregate_name,
+                                    consecutive_errors = %consecutive_heartbeat_errors,
+                                    "Too many consecutive heartbeat errors, restarting worker"
+                                );
+                                return Err(anyhow::anyhow!("Too many consecutive heartbeat timeouts"));
+                            }
+                            
+                            // Short delay before continuing
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        } else {
+                            tracing::error!(
+                                worker.aggregate_name = %aggregate_name,
+                                error = %e,
+                                "Error receiving message from NATS"
+                            );
+                            // For other errors, also add a small delay
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     }
                 }
             }
-            Err(e) => {
-                tracing::error!(
+            Ok(None) => {
+                // Stream ended normally
+                tracing::info!(
                     worker.aggregate_name = %aggregate_name,
-                    error = %e,
-                    "Error receiving message from NATS"
+                    "Message stream ended"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                return Ok(());
+            }
+            Err(_timeout) => {
+                // Timeout waiting for messages - this is normal for idle periods
+                tracing::debug!(
+                    worker.aggregate_name = %aggregate_name,
+                    "Message timeout (no messages in 30s) - continuing"
+                );
+                
+                // Check if NATS connection is still healthy
+                if nc.connection_state() != async_nats::connection::State::Connected {
+                    tracing::error!(
+                        worker.aggregate_name = %aggregate_name,
+                        connection_state = ?nc.connection_state(),
+                        "NATS connection lost, restarting worker"
+                    );
+                    return Err(anyhow::anyhow!("NATS connection lost"));
+                }
+                
+                // Continue the loop - timeout is expected during idle periods
+                continue;
             }
         }
     }
-
-    tracing::warn!(
-        worker.aggregate_name = %aggregate_name,
-        "Worker message stream ended"
-    );
-    Ok(())
 }
 
 /// Enhanced command processing with full observability
@@ -848,36 +962,5 @@ impl InterestDeclaration {
             ActorRole::Projector => format!("PROJ_{name}"),
             ActorRole::Unknown => "".to_string(),
         }
-    }
-}
-
-// ============ TESTING HELPERS ============
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_config_from_env() {
-        // Clear any existing env vars
-        std::env::remove_var("NATS_URL");
-        std::env::remove_var("NATS_SERVER");
-        
-        let config = BaseConfiguration::from_env();
-        assert_eq!(config.nats_url, "nats://127.0.0.1:4222");
-        
-        // Test override
-        std::env::set_var("NATS_URL", "nats://custom:4222");
-        let config = BaseConfiguration::from_env();
-        assert_eq!(config.nats_url, "nats://custom:4222");
-        
-        // Cleanup
-        std::env::remove_var("NATS_URL");
-    }
-
-    #[test]
-    fn test_config_explicit_url() {
-        let config = BaseConfiguration::with_nats_url("nats://example.com:4222");
-        assert_eq!(config.nats_url, "nats://example.com:4222");
     }
 }

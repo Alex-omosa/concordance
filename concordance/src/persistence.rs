@@ -1,4 +1,4 @@
-// concordance/src/persistence.rs - Fixed NATS KV State Management with better error handling
+// concordance/src/persistence.rs - Fixed NATS KV State Management with enhanced compatibility
 
 use async_nats::jetstream::{kv::Config as KvConfig, kv::Store, Context};
 use tracing::{debug, error, instrument, trace, warn, info};
@@ -13,9 +13,9 @@ pub struct EntityState {
 }
 
 impl EntityState {
-    /// Create a new EntityState instance from JetStream context with retries
+    /// Create a new EntityState instance from JetStream context with enhanced retry logic
     pub async fn new_from_context(context: &Context) -> Result<EntityState> {
-        let bucket = get_or_create_bucket_with_retry(context, 3).await?;
+        let bucket = get_or_create_bucket_with_enhanced_retry(context, 5).await?;
         
         info!("✅ EntityState initialized with NATS KV bucket: {}", STATE_BUCKET_NAME);
         Ok(EntityState { bucket })
@@ -119,8 +119,8 @@ impl EntityState {
     }
 }
 
-/// Create or get the NATS KV bucket with retry logic for better compatibility
-async fn get_or_create_bucket_with_retry(js: &Context, max_retries: u32) -> Result<Store> {
+/// Enhanced bucket creation with better error handling and compatibility
+async fn get_or_create_bucket_with_enhanced_retry(js: &Context, max_retries: u32) -> Result<Store> {
     info!("🔧 Initializing NATS KV bucket: {} (with {} retries)", STATE_BUCKET_NAME, max_retries);
 
     for attempt in 1..=max_retries {
@@ -137,10 +137,10 @@ async fn get_or_create_bucket_with_retry(js: &Context, max_retries: u32) -> Resu
             }
         }
 
-        // Try to create new bucket with simplified config for better compatibility
-        match create_bucket_with_simple_config(js).await {
+        // Try multiple creation strategies
+        match create_bucket_with_fallback_strategy(js, attempt).await {
             Ok(store) => {
-                info!("✅ Created new KV bucket: {}", STATE_BUCKET_NAME);
+                info!("✅ Created new KV bucket: {} on attempt {}", STATE_BUCKET_NAME, attempt);
                 return Ok(store);
             }
             Err(e) => {
@@ -153,8 +153,9 @@ async fn get_or_create_bucket_with_retry(js: &Context, max_retries: u32) -> Resu
                     )));
                 }
                 
-                // Wait before retrying
-                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                // Progressive backoff
+                let delay_ms = 500 * attempt as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
         }
     }
@@ -162,41 +163,111 @@ async fn get_or_create_bucket_with_retry(js: &Context, max_retries: u32) -> Resu
     Err(Error::msg("Unexpected end of retry loop"))
 }
 
-/// Create bucket with simplified configuration for maximum compatibility
-async fn create_bucket_with_simple_config(js: &Context) -> Result<Store> {
-    debug!("Creating KV bucket with simplified configuration for compatibility");
+/// Create bucket with multiple fallback strategies to handle version compatibility
+async fn create_bucket_with_fallback_strategy(js: &Context, attempt: u32) -> Result<Store> {
+    debug!("Creating KV bucket with fallback strategy, attempt {}", attempt);
     
-    // Try with minimal configuration first
-    let minimal_config = KvConfig {
-        bucket: STATE_BUCKET_NAME.to_string(),
-        description: "Concordance state storage".to_string(),
-        history: 1, // Minimal history
-        ..Default::default()
-    };
-    
-    match js.create_key_value(minimal_config).await {
-        Ok(store) => {
-            info!("✅ Created KV bucket with minimal config");
-            Ok(store)
-        }
-        Err(e) => {
-            debug!("Minimal config failed: {:?}, trying with explicit settings", e);
+    match attempt {
+        1 => {
+            // Strategy 1: Absolutely minimal config (most compatible)
+            debug!("Trying minimal config strategy");
+            let minimal_config = KvConfig {
+                bucket: STATE_BUCKET_NAME.to_string(),
+                ..Default::default()
+            };
             
-            // Try with more explicit settings
-            let explicit_config = KvConfig {
+            js.create_key_value(minimal_config)
+                .await
+                .map_err(|e| Error::msg(format!("Minimal config failed: {:?}", e)))
+        }
+        2 => {
+            // Strategy 2: Basic config with essential settings only
+            debug!("Trying basic config strategy");
+            let basic_config = KvConfig {
+                bucket: STATE_BUCKET_NAME.to_string(),
+                description: "Concordance state storage".to_string(),
+                history: 1,
+                ..Default::default()
+            };
+            
+            js.create_key_value(basic_config)
+                .await
+                .map_err(|e| Error::msg(format!("Basic config failed: {:?}", e)))
+        }
+        3 => {
+            // Strategy 3: Explicit storage settings
+            debug!("Trying explicit storage config strategy");
+            let storage_config = KvConfig {
                 bucket: STATE_BUCKET_NAME.to_string(),
                 description: "Concordance aggregate state storage".to_string(),
                 history: 1,
-                max_value_size: 1024 * 1024, // 1MB max per value
-                max_age: std::time::Duration::from_secs(0), // No expiration
+                max_value_size: 1024 * 1024, // 1MB max
                 storage: async_nats::jetstream::stream::StorageType::File,
                 num_replicas: 1,
                 ..Default::default()
             };
             
-            js.create_key_value(explicit_config)
+            js.create_key_value(storage_config)
                 .await
-                .map_err(|e| Error::msg(format!("Failed to create KV bucket with explicit config: {:?}", e)))
+                .map_err(|e| Error::msg(format!("Storage config failed: {:?}", e)))
+        }
+        4 => {
+            // Strategy 4: Memory storage (for compatibility)
+            debug!("Trying memory storage config strategy");
+            let memory_config = KvConfig {
+                bucket: STATE_BUCKET_NAME.to_string(),
+                description: "Concordance state storage (memory)".to_string(),
+                history: 1,
+                storage: async_nats::jetstream::stream::StorageType::Memory,
+                num_replicas: 1,
+                ..Default::default()
+            };
+            
+            js.create_key_value(memory_config)
+                .await
+                .map_err(|e| Error::msg(format!("Memory config failed: {:?}", e)))
+        }
+        _ => {
+            // Strategy 5+: Last resort with no optional fields
+            debug!("Trying last resort config strategy");
+            
+            // Use the underlying stream creation approach as fallback
+            create_kv_via_stream_creation(js).await
         }
     }
+}
+
+/// Last resort: Create KV bucket by manually creating the underlying stream
+async fn create_kv_via_stream_creation(js: &Context) -> Result<Store> {
+    use async_nats::jetstream::stream::{Config as StreamConfig, RetentionPolicy, StorageType};
+    
+    debug!("Attempting to create KV bucket via manual stream creation");
+    
+    let stream_name = format!("KV_{}", STATE_BUCKET_NAME);
+    let subject = format!("$KV.{}.>", STATE_BUCKET_NAME);
+    
+    let stream_config = StreamConfig {
+        name: stream_name.clone(),
+        description: Some("Concordance KV state store".to_string()),
+        subjects: vec![subject],
+        retention: RetentionPolicy::Limits,
+        storage: StorageType::File,
+        num_replicas: 1,
+        max_age: std::time::Duration::ZERO, // No expiration
+        discard: async_nats::jetstream::stream::DiscardPolicy::New,
+        allow_rollup: true,
+        ..Default::default()
+    };
+    
+    // Create the stream first
+    js.create_stream(stream_config)
+        .await
+        .map_err(|e| Error::msg(format!("Failed to create KV stream: {:?}", e)))?;
+    
+    // Now try to get the KV bucket
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    
+    js.get_key_value(STATE_BUCKET_NAME)
+        .await
+        .map_err(|e| Error::msg(format!("Failed to get KV bucket after stream creation: {:?}", e)))
 }
