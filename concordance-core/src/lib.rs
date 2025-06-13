@@ -154,14 +154,12 @@ where
 
 pub fn get_registered_aggregates() -> Vec<&'static str> {
     inventory::iter::<AggregateDescriptor>()
-        .into_iter()
         .map(|desc| desc.name)
         .collect()
 }
 
 pub fn is_aggregate_registered(name: &str) -> bool {
     inventory::iter::<AggregateDescriptor>()
-        .into_iter()
         .any(|desc| desc.name == name)
 }
 
