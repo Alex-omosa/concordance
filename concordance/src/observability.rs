@@ -1,7 +1,6 @@
 // concordance/src/observability.rs - OpenTelemetry Observability
 
-use std::sync::Arc;
-use tracing::{info_span, Instrument, Span, Level};
+use tracing::Span;
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 use chrono::Utc;
@@ -11,7 +10,6 @@ use opentelemetry::{
     metrics::{Counter, Histogram, Meter},
     KeyValue,
 };
-use opentelemetry_sdk::metrics::MeterProvider;
 use tracing_subscriber::{util::SubscriberInitExt, EnvFilter};
 
 // ============ CORRELATION CONTEXT ============
@@ -490,7 +488,7 @@ pub fn init_tracing() -> Result<()> {
 /// Initialize tracing with OpenTelemetry and Jaeger
 #[cfg(feature = "opentelemetry")]
 pub fn init_tracing_with_otel(filter: EnvFilter) -> Result<()> {
-    use opentelemetry_sdk::trace::TracerProvider;
+    
     use opentelemetry_otlp::WithExportConfig;
     use tracing_subscriber::layer::SubscriberExt;
     use opentelemetry_sdk::Resource;
